@@ -1,3 +1,4 @@
 [submodule "submodules/Morpheus"]
 	path = submodules/Morpheus
 	url = git@github.com:purseclab/Morpheus.git
+	branch = integration
