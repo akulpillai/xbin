@@ -24,29 +24,29 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x12orchestrator.proto\x12\x0corchestrator\"z\n\x0fRegisterRequest\x12\x11\n\tworker_id\x18\x01 \x01(\t\x12\x14\n\x0c\x62\x61\x63kend_name\x18\x02 \x01(\t\x12\x15\n\ranalysis_type\x18\x03 \x01(\t\x12\x14\n\x0cis_validator\x18\x04 \x01(\x08\x12\x11\n\tis_ranker\x18\x05 \x01(\x08\"#\n\x10RegisterResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\"=\n\x10HeartbeatRequest\x12\x11\n\tworker_id\x18\x01 \x01(\t\x12\x16\n\x0estatus_message\x18\x02 \x01(\t\")\n\x11HeartbeatResponse\x12\x14\n\x0c\x61\x63knowledged\x18\x01 \x01(\x08\"\x99\x01\n\x11PostResultRequest\x12\x15\n\ranalysis_type\x18\x01 \x01(\t\x12\x10\n\x08item_key\x18\x02 \x01(\t\x12\x13\n\x0bresult_data\x18\x03 \x01(\t\x12\x12\n\nconfidence\x18\x04 \x01(\x02\x12\x14\n\x0c\x62\x61\x63kend_name\x18\x05 \x01(\t\x12\x1c\n\x14validation_target_id\x18\x06 \x01(\t\">\n\x12PostResultResponse\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x01 \x01(\x08\x12\x16\n\x0e\x63urrent_status\x18\x02 \x01(\t\"\x83\x01\n\x11UpdateRankRequest\x12\x15\n\ranalysis_type\x18\x01 \x01(\t\x12\x10\n\x08item_key\x18\x02 \x01(\t\x12\x1c\n\x14target_hypothesis_id\x18\x03 \x01(\t\x12\x11\n\tnew_score\x18\x04 \x01(\x02\x12\x14\n\x0c\x62\x61\x63kend_name\x18\x05 \x01(\t\"&\n\x12UpdateRankResponse\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x01 \x01(\x08\x32\xd6\x02\n\x13OrchestratorService\x12O\n\x0eRegisterWorker\x12\x1d.orchestrator.RegisterRequest\x1a\x1e.orchestrator.RegisterResponse\x12O\n\nPostResult\x12\x1f.orchestrator.PostResultRequest\x1a .orchestrator.PostResultResponse\x12O\n\nUpdateRank\x12\x1f.orchestrator.UpdateRankRequest\x1a .orchestrator.UpdateRankResponse\x12L\n\tHeartbeat\x12\x1e.orchestrator.HeartbeatRequest\x1a\x1f.orchestrator.HeartbeatResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x12orchestrator.proto\x12\x0corchestrator\"\xa5\x01\n\x0fRegisterRequest\x12\x11\n\tworker_id\x18\x01 \x01(\t\x12\x14\n\x0c\x62\x61\x63kend_name\x18\x02 \x01(\t\x12\x15\n\ranalysis_type\x18\x03 \x01(\t\x12\x14\n\x0cis_validator\x18\x04 \x01(\x08\x12\x11\n\tis_ranker\x18\x05 \x01(\x08\x12\x14\n\x0c\x64isplay_name\x18\x06 \x01(\t\x12\x13\n\x0b\x64\x65scription\x18\x07 \x01(\t\"#\n\x10RegisterResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\"=\n\x10HeartbeatRequest\x12\x11\n\tworker_id\x18\x01 \x01(\t\x12\x16\n\x0estatus_message\x18\x02 \x01(\t\")\n\x11HeartbeatResponse\x12\x14\n\x0c\x61\x63knowledged\x18\x01 \x01(\x08\"\x99\x01\n\x11PostResultRequest\x12\x15\n\ranalysis_type\x18\x01 \x01(\t\x12\x10\n\x08item_key\x18\x02 \x01(\t\x12\x13\n\x0bresult_data\x18\x03 \x01(\t\x12\x12\n\nconfidence\x18\x04 \x01(\x02\x12\x14\n\x0c\x62\x61\x63kend_name\x18\x05 \x01(\t\x12\x1c\n\x14validation_target_id\x18\x06 \x01(\t\">\n\x12PostResultResponse\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x01 \x01(\x08\x12\x16\n\x0e\x63urrent_status\x18\x02 \x01(\t\"\x83\x01\n\x11UpdateRankRequest\x12\x15\n\ranalysis_type\x18\x01 \x01(\t\x12\x10\n\x08item_key\x18\x02 \x01(\t\x12\x1c\n\x14target_hypothesis_id\x18\x03 \x01(\t\x12\x11\n\tnew_score\x18\x04 \x01(\x02\x12\x14\n\x0c\x62\x61\x63kend_name\x18\x05 \x01(\t\"&\n\x12UpdateRankResponse\x12\x10\n\x08\x61\x63\x63\x65pted\x18\x01 \x01(\x08\x32\xd6\x02\n\x13OrchestratorService\x12O\n\x0eRegisterWorker\x12\x1d.orchestrator.RegisterRequest\x1a\x1e.orchestrator.RegisterResponse\x12O\n\nPostResult\x12\x1f.orchestrator.PostResultRequest\x1a .orchestrator.PostResultResponse\x12O\n\nUpdateRank\x12\x1f.orchestrator.UpdateRankRequest\x1a .orchestrator.UpdateRankResponse\x12L\n\tHeartbeat\x12\x1e.orchestrator.HeartbeatRequest\x1a\x1f.orchestrator.HeartbeatResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
 _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'orchestrator_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   DESCRIPTOR._loaded_options = None
-  _globals['_REGISTERREQUEST']._serialized_start=36
-  _globals['_REGISTERREQUEST']._serialized_end=158
-  _globals['_REGISTERRESPONSE']._serialized_start=160
-  _globals['_REGISTERRESPONSE']._serialized_end=195
-  _globals['_HEARTBEATREQUEST']._serialized_start=197
-  _globals['_HEARTBEATREQUEST']._serialized_end=258
-  _globals['_HEARTBEATRESPONSE']._serialized_start=260
-  _globals['_HEARTBEATRESPONSE']._serialized_end=301
-  _globals['_POSTRESULTREQUEST']._serialized_start=304
-  _globals['_POSTRESULTREQUEST']._serialized_end=457
-  _globals['_POSTRESULTRESPONSE']._serialized_start=459
-  _globals['_POSTRESULTRESPONSE']._serialized_end=521
-  _globals['_UPDATERANKREQUEST']._serialized_start=524
-  _globals['_UPDATERANKREQUEST']._serialized_end=655
-  _globals['_UPDATERANKRESPONSE']._serialized_start=657
-  _globals['_UPDATERANKRESPONSE']._serialized_end=695
-  _globals['_ORCHESTRATORSERVICE']._serialized_start=698
-  _globals['_ORCHESTRATORSERVICE']._serialized_end=1040
+  _globals['_REGISTERREQUEST']._serialized_start=37
+  _globals['_REGISTERREQUEST']._serialized_end=202
+  _globals['_REGISTERRESPONSE']._serialized_start=204
+  _globals['_REGISTERRESPONSE']._serialized_end=239
+  _globals['_HEARTBEATREQUEST']._serialized_start=241
+  _globals['_HEARTBEATREQUEST']._serialized_end=302
+  _globals['_HEARTBEATRESPONSE']._serialized_start=304
+  _globals['_HEARTBEATRESPONSE']._serialized_end=345
+  _globals['_POSTRESULTREQUEST']._serialized_start=348
+  _globals['_POSTRESULTREQUEST']._serialized_end=501
+  _globals['_POSTRESULTRESPONSE']._serialized_start=503
+  _globals['_POSTRESULTRESPONSE']._serialized_end=565
+  _globals['_UPDATERANKREQUEST']._serialized_start=568
+  _globals['_UPDATERANKREQUEST']._serialized_end=699
+  _globals['_UPDATERANKRESPONSE']._serialized_start=701
+  _globals['_UPDATERANKRESPONSE']._serialized_end=739
+  _globals['_ORCHESTRATORSERVICE']._serialized_start=742
+  _globals['_ORCHESTRATORSERVICE']._serialized_end=1084
 # @@protoc_insertion_point(module_scope)

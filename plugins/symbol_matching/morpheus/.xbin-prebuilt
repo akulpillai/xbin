@@ -1,5 +1,0 @@
-# Presence of this file tells the xbin orchestrator NOT to build this plugin.
-# It extends the heavy Binary Ninja pysindy base the orchestrator cannot build;
-# build it out-of-band with ./build.sh, then the orchestrator reuses the image
-# xbin-plugin-symbol_matching-morpheus.
-# Rebuild: re-run ./build.sh, or `docker rmi xbin-plugin-symbol_matching-morpheus`.

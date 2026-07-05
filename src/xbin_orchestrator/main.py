@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import threading
 from concurrent import futures
@@ -40,14 +41,16 @@ PLUGIN_DIRS = [DEFAULT_PLUGINS_DIR]
 EXPLICIT_PLUGINS = []
 UPLOAD_DIR = "uploads"
 
+# Per-backend consensus weights (multiplied into each result's raw confidence).
+# The four BIND tools + the ollama arbiter. Signature matchers (fid/ghidriff)
+# produce high-precision identity matches, so they carry more weight than the
+# semantic recoverers (bind_se/symbolic_regression). Unknown backends -> 0.5.
 BACKEND_WEIGHTS = {
-    "exact_hasher": 1.0,
-    "agentic_arbiter": 1.0,
-    "flirt_matcher": 1.0,
-    "angr_boundaries": 1.0,
-    "radare_boundaries": 0.85,
-    "semantic_llm": 0.85,
-    "structural_cfg": 0.70
+    "fid": 1.0,                  # Ghidra FunctionID signature matching
+    "ghidriff": 0.95,           # Ghidra ghidriff / BSim binary diffing
+    "bind_se": 0.85,            # angr symbolic execution + ollama explanation
+    "symbolic_regression": 0.85, # PySR symbolic regression + ollama explanation
+    "bind_arbiter": 1.0,        # ollama arbiter (ranker)
 }
 MARGIN_THRESHOLD = 0.05
 
@@ -137,17 +140,17 @@ def get_health():
     return {"orchestrator": "HEALTHY", "worker_fleet": workers}
 
 @app.post("/api/v1/upload")
-async def upload_binary(file: UploadFile = File(...), iopairs: UploadFile = File(None), requested_analyses: str = Form("")):
+async def upload_binary(file: UploadFile = File(...), reference: UploadFile = File(None), requested_analyses: str = Form("")):
     file_path = os.path.join(UPLOAD_DIR, file.filename)
     with open(file_path, "wb") as buffer: shutil.copyfileobj(file.file, buffer)
-    # Optional ground-truth I/O pairs: save next to the binary under the sibling
-    # name the worker derives (<binary-stem>.iopairs.txt), regardless of the
-    # uploaded filename, so equation recovery can score/fit instead of returning
-    # an empty (skeleton-only) result.
-    if iopairs is not None and iopairs.filename:
-        iop_path = os.path.join(UPLOAD_DIR, os.path.splitext(file.filename)[0] + ".iopairs.txt")
-        with open(iop_path, "wb") as buffer: shutil.copyfileobj(iopairs.file, buffer)
-        sys_log(f"Upload: iopairs -> {os.path.basename(iop_path)}")
+    # Optional symbolized reference binary: save next to the target under the
+    # sibling name the BIND plugins derive (<binary-stem>.reference), regardless
+    # of the uploaded filename, so ghidriff/bind_se diff against it instead of
+    # the baked default reference.
+    if reference is not None and reference.filename:
+        ref_path = os.path.join(UPLOAD_DIR, os.path.splitext(file.filename)[0] + ".reference")
+        with open(ref_path, "wb") as buffer: shutil.copyfileobj(reference.file, buffer)
+        sys_log(f"Upload: reference -> {os.path.basename(ref_path)}")
     analyses = [a.strip() for a in requested_analyses.split(",") if a.strip()]
     sys_log(f"Upload: {file.filename} for {analyses}")
     r.publish("xbin:events", json.dumps({"type": "NEW_BINARY", "filename": file.filename, "path": f"/app/uploads/{file.filename}", "requested_analyses": analyses}))
@@ -213,7 +216,7 @@ def list_available_plugins():
             seen.add(uid)
 
     # Map each category to its active ranker name (if any is registered)
-    categories = list(set([p["category"] for p in unique_available] + ["symbol_matching", "cfg_generation", "function_boundary"]))
+    categories = list(set([p["category"] for p in unique_available] + ["signature_matching", "equation_recovery"]))
     ranker_map = {}
     for cat in categories:
         ranker_map[cat] = next((p["name"] for p in unique_available if p["category"] == cat and p["is_ranker"]), "Baseline")
@@ -257,20 +260,28 @@ def _get_plugin_info(root, name, category, docker_data, health_data, now):
     saved = json.loads(state_str) if state_str else {"status": "STOPPED"}
     status = saved["status"]
     
-    # Static discovery: Check if is_validator/is_ranker=True
+    # Static discovery: scan the plugin source for decorator metadata so the
+    # dashboard can show validator/ranker badges + a display name/description
+    # BEFORE the plugin is ever started.
     is_validator = saved.get("is_validator", False)
     is_ranker = saved.get("is_ranker", False)
+    display_name = saved.get("display_name", "")
+    description = saved.get("description", "")
     files = os.listdir(root) if os.path.isdir(root) else []
-    if not is_validator or not is_ranker:
-        for f in files:
-            if f.endswith(".py"):
-                try:
-                    with open(os.path.join(root, f), "r") as pf:
-                        content = pf.read()
-                        if "is_validator=True" in content: is_validator = True
-                        if "is_ranker=True" in content: is_ranker = True
-                        if is_validator and is_ranker: break
-                except: pass
+    for f in files:
+        if not f.endswith(".py"): continue
+        try:
+            with open(os.path.join(root, f), "r") as pf:
+                content = pf.read()
+        except: continue
+        if "is_validator=True" in content: is_validator = True
+        if "is_ranker=True" in content: is_ranker = True
+        if not display_name:
+            m = re.search(r'display_name\s*=\s*["\']([^"\']+)["\']', content)
+            if m: display_name = m.group(1)
+        if not description:
+            m = re.search(r'description\s*=\s*["\']([^"\']+)["\']', content)
+            if m: description = m.group(1)
 
     if unique_id in docker_data:
         d = docker_data[unique_id]
@@ -283,8 +294,10 @@ def _get_plugin_info(root, name, category, docker_data, health_data, now):
             last_beat = w_data["last_heartbeat"]; health_status = "HEALTHY" if (now - last_beat) < 10 else "DEAD"
             if "is_validator" in w_data: is_validator = w_data["is_validator"]
             if "is_ranker" in w_data: is_ranker = w_data["is_ranker"]
-            
-    return {"name": name, "category": category, "status": status, "health": health_status, "last_beat": last_beat, "error": saved.get("error"), "is_validator": is_validator, "is_ranker": is_ranker}
+            if w_data.get("display_name"): display_name = w_data["display_name"]
+            if w_data.get("description"): description = w_data["description"]
+
+    return {"name": name, "category": category, "status": status, "health": health_status, "last_beat": last_beat, "error": saved.get("error"), "is_validator": is_validator, "is_ranker": is_ranker, "display_name": display_name or name, "description": description}
 
 def _plugin_matches(root, name, category):
     static_cat, static_name = get_static_plugin_info(root)
@@ -316,8 +329,8 @@ def get_plugin_path_and_context(name: str, category: str):
     if os.path.exists(default_path):
         return default_path, default_path
 
-    # Plugin directories do not have to match the decorator name. For example,
-    # plugins/cfg_generation/radare declares name="radare_cfg".
+    # Plugin directories do not have to match the decorator name; discovery scans
+    # the source for @xbin.plugin(name=..., category=...) and prefers those.
     for pdir in PLUGIN_DIRS:
         if not os.path.exists(pdir):
             continue
@@ -506,8 +519,8 @@ def dashboard():
                 <button class="btn" style="background: #2d3748;" onclick="showSystemLogs()">System Logs</button>
                 <button class="btn btn-danger btn-action" onclick="clearSession()">Clear Session</button>
                 <button class="btn btn-primary btn-action" onclick="bulkAction('start')">Start Fleet</button>
-                <input type="file" id="iop" style="display:none" onchange="document.getElementById('iopl').innerText=this.files[0].name">
-                <button class="btn btn-action" style="background:#2d3748" onclick="document.getElementById('iop').click()">📊 <span id="iopl">IO Pairs</span></button>
+                <input type="file" id="ref" style="display:none" onchange="document.getElementById('refl').innerText=this.files[0].name">
+                <button class="btn btn-action" style="background:#2d3748" onclick="document.getElementById('ref').click()">📎 <span id="refl">Reference Bin</span></button>
                 <button class="btn btn-danger btn-action" onclick="powerOff()">Power Off</button>
                 <div id="orc-health" class="badge badge-running">Orchestrator: OK</div>
             </div>
@@ -520,9 +533,8 @@ def dashboard():
                     <button class="btn btn-primary" style="width:100%" onclick="document.getElementById('f').click()">📁 <span id="fl">Choose Binary</span></button>
                     <div style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--border);">
                         <div style="display:grid; grid-template-columns: 1fr 1fr; gap:0.4rem;">
-                            <label style="font-size:0.75rem; display:flex; align-items:center; gap:0.3rem;"><input type="checkbox" class="goal" value="symbol_matching" checked> Symbols</label>
-                            <label style="font-size:0.75rem; display:flex; align-items:center; gap:0.3rem;"><input type="checkbox" class="goal" value="cfg_generation" checked> CFG</label>
-                            <label style="font-size:0.75rem; display:flex; align-items:center; gap:0.3rem;"><input type="checkbox" class="goal" value="function_boundary" checked> Boundaries</label>
+                            <label style="font-size:0.75rem; display:flex; align-items:center; gap:0.3rem;"><input type="checkbox" class="goal" value="signature_matching" checked> Signature Matching</label>
+                            <label style="font-size:0.75rem; display:flex; align-items:center; gap:0.3rem;"><input type="checkbox" class="goal" value="equation_recovery" checked> Equation Recovery</label>
                         </div>
                     </div>
                     <button class="btn btn-primary" style="width:100%; margin-top:1rem; background:var(--success)" onclick="upload()">🚀 Start Analysis</button>
@@ -548,11 +560,13 @@ def dashboard():
         <div class="toast-container" id="toasts"></div>
         <script>
             let lastHeartbeats = {};
+            const CAT_LABELS = { signature_matching: 'Signature Matching', equation_recovery: 'Equation Recovery' };
+            function catLabel(c) { return CAT_LABELS[c] || c.replace(/_/g,' '); }
             function toast(m) { const t=document.createElement('div'); t.className='toast'; t.innerText=m; document.getElementById('toasts').appendChild(t); setTimeout(()=>t.remove(),3000); }
             async function upload() {
                 const fd=new FormData(); fd.append('file', document.getElementById('f').files[0]);
-                const iop=document.getElementById('iop').files[0];
-                if(iop) fd.append('iopairs', iop);
+                const ref=document.getElementById('ref').files[0];
+                if(ref) fd.append('reference', ref);
                 const goals=Array.from(document.querySelectorAll('.goal:checked')).map(i=>i.value);
                 fd.append('requested_analyses', goals.join(','));
                 await fetch('/api/v1/upload', {method:'POST', body:fd}); toast('Binary Announced');
@@ -600,6 +614,37 @@ def dashboard():
                 document.getElementById('modal-legend').innerHTML = ''; document.getElementById('modal-content').style.display='block';
                 document.getElementById('overlay').style.display='block'; document.getElementById('modal').style.display='flex';
                 fetch(`/api/v1/blackboard/${cat}/audit`).then(r=>r.json()).then(d=>document.getElementById('modal-content').innerText=d.logs || 'No entries.');
+            }
+            async function showExplanation(cat, item) {
+                document.getElementById('modal-title').innerText = `${catLabel(cat)}: ${item}`;
+                document.getElementById('cy-container').style.display='none';
+                document.getElementById('mem-map-container').style.display='none';
+                document.getElementById('modal-legend').innerHTML = '';
+                const content = document.getElementById('modal-content');
+                content.style.display='block';
+                document.getElementById('overlay').style.display='block';
+                document.getElementById('modal').style.display='flex';
+                content.innerText = 'Loading...';
+                try {
+                    const res = await fetch(`/api/v1/blackboard/${cat}/results`);
+                    const d = await res.json();
+                    const entry = (d.results || {})[item];
+                    if (!entry || !entry.hypotheses || !entry.hypotheses.length) { content.innerText = 'No data.'; return; }
+                    const lines = [];
+                    entry.hypotheses.forEach((h, i) => {
+                        const data = h.data || {};
+                        lines.push('='.repeat(60));
+                        lines.push(`#${i+1}  via ${h.backend}   score=${h.score}   raw_conf=${h.raw_conf}`);
+                        if ((h.validators||[]).length) lines.push(`vouched by: ${h.validators.join(', ')}`);
+                        if (data.known_function) lines.push(`Identity: ${data.known_function}` + (data.confidence!=null?`  (conf ${data.confidence})`:''));
+                        if (data.matchers) lines.push(`Matchers: ${(data.matchers||[]).join(', ')}`);
+                        if (data.recovered_expression) lines.push(`Expression: ${data.recovered_expression}`);
+                        if (data.explanation) lines.push(`\nExplanation:\n${data.explanation}`);
+                        if (data.output_dir) lines.push(`Output: ${data.output_dir}`);
+                        lines.push('');
+                    });
+                    content.innerText = lines.join('\n');
+                } catch (e) { content.innerText = `Error: ${e.message}`; }
             }
             async function showConsensus(cat, item) {
                 const modal = document.getElementById('modal'); const overlay = document.getElementById('overlay');
@@ -688,11 +733,11 @@ def dashboard():
                     let html = '';
                     for(let cat in cats) {
                         const isCollapsed = collapsedCategories[cat];
-                        html += `<div style="display:flex; justify-content:space-between; align-items:center; margin:1.5rem 0 0.5rem; cursor:pointer; user-select:none;" onclick="toggleCategory('${cat}')"><div style="font-size:0.7rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.1em; font-weight:700;"><span id="cat-arrow-${cat}" style="display:inline-block; transition:transform 0.2s; transform:${isCollapsed ? 'rotate(-90deg)' : 'rotate(0deg)'};">&#9660;</span> ${cat.replace('_',' ')}</div><div style="display:flex; gap:0.25rem" onclick="event.stopPropagation()"><button class="btn btn-action" onclick="bulkAction('stop', '${cat}')">Stop</button><button class="btn btn-primary btn-action" onclick="bulkAction('start', '${cat}')">Start</button></div></div>`;
+                        html += `<div style="display:flex; justify-content:space-between; align-items:center; margin:1.5rem 0 0.5rem; cursor:pointer; user-select:none;" onclick="toggleCategory('${cat}')"><div style="font-size:0.7rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.1em; font-weight:700;"><span id="cat-arrow-${cat}" style="display:inline-block; transition:transform 0.2s; transform:${isCollapsed ? 'rotate(-90deg)' : 'rotate(0deg)'};">&#9660;</span> ${catLabel(cat)}</div><div style="display:flex; gap:0.25rem" onclick="event.stopPropagation()"><button class="btn btn-action" onclick="bulkAction('stop', '${cat}')">Stop</button><button class="btn btn-primary btn-action" onclick="bulkAction('start', '${cat}')">Start</button></div></div>`;
                         html += `<div id="cat-content-${cat}" style="display:${isCollapsed ? 'none' : 'block'};">`;
                         cats[cat].forEach(p => {
                             const isNewBeat = p.last_beat > (lastHeartbeats[p.name] || 0);
-                            html += `<div class="plugin-item" id="card-${p.name}"><div id="beat-${p.name}" class="heartbeat-ping ${isNewBeat ? 'ping-active' : ''}"></div><div style="display:flex; justify-content:space-between; align-items:start"><div><div style="font-weight:bold">${p.name}</div><div style="display:flex; align-items:center; gap:0.3rem; margin-top:0.2rem"><div class="badge badge-${p.status==='RUNNING'?'running':p.status==='STOPPED'?'stopped':'error'}">${p.status}</div>${p.is_validator ? '<div class="badge badge-validator">Validator</div>' : ''}${p.is_ranker ? '<div class="badge badge-ranker" style="font-style:normal;">Ranker</div>' : ''}${p.health==='HEALTHY'?'<span style="color:var(--success); font-size:0.6rem; font-weight:bold">READY</span>':''}</div></div><div style="display:flex; flex-direction:column; gap:0.2rem"><button class="btn btn-action ${p.status==='RUNNING'?'btn-danger':'btn-primary'}" onclick="toggle('${p.name}','${p.category}','${p.status}')">${p.status==='RUNNING'?'Stop':'Start'}</button><button class="btn btn-action" style="background:#2d3748" onclick="showLogs('${p.name}','${p.category}')">Logs</button></div></div>${p.error ? `<div style="font-size:0.6rem; color:var(--danger); margin-top:0.3rem; border-top:1px solid rgba(239,68,68,0.1); padding-top:0.2rem">${p.error}</div>` : ''}</div>`;
+                            html += `<div class="plugin-item" id="card-${p.name}"><div id="beat-${p.name}" class="heartbeat-ping ${isNewBeat ? 'ping-active' : ''}"></div><div style="display:flex; justify-content:space-between; align-items:start"><div style="flex:1; min-width:0"><div style="font-weight:bold">${p.display_name || p.name}</div><div style="font-size:0.6rem; color:var(--muted); font-family:monospace">${p.name}</div><div style="display:flex; align-items:center; gap:0.3rem; margin-top:0.2rem; flex-wrap:wrap"><div class="badge badge-${p.status==='RUNNING'?'running':p.status==='STOPPED'?'stopped':'error'}">${p.status}</div>${p.is_validator ? '<div class="badge badge-validator">Validator</div>' : ''}${p.is_ranker ? '<div class="badge badge-ranker" style="font-style:normal;">Ranker</div>' : ''}${p.health==='HEALTHY'?'<span style="color:var(--success); font-size:0.6rem; font-weight:bold">READY</span>':''}</div>${p.description ? '<div style="font-size:0.62rem; color:var(--muted); margin-top:0.35rem; line-height:1.3">'+p.description+'</div>' : ''}</div><div style="display:flex; flex-direction:column; gap:0.2rem"><button class="btn btn-action ${p.status==='RUNNING'?'btn-danger':'btn-primary'}" onclick="toggle('${p.name}','${p.category}','${p.status}')">${p.status==='RUNNING'?'Stop':'Start'}</button><button class="btn btn-action" style="background:#2d3748" onclick="showLogs('${p.name}','${p.category}')">Logs</button></div></div>${p.error ? `<div style="font-size:0.6rem; color:var(--danger); margin-top:0.3rem; border-top:1px solid rgba(239,68,68,0.1); padding-top:0.2rem">${p.error}</div>` : ''}</div>`;
                             if (isNewBeat) lastHeartbeats[p.name] = p.last_beat;
                         });
                         html += `</div>`;
@@ -700,21 +745,26 @@ def dashboard():
                     if (pluginList.innerHTML !== html) pluginList.innerHTML = html;
                     const bb = document.getElementById('bb-content');
                     const rankers = pData.rankers || {};
-                    const categories = [...new Set([...pData.plugins.map(p => p.category), 'symbol_matching', 'cfg_generation', 'function_boundary'])];
+                    const categories = [...new Set([...pData.plugins.map(p => p.category), 'signature_matching', 'equation_recovery'])];
                     for (let cat of categories) {
                         const res = await fetch(`/api/v1/blackboard/${cat}/results`); const d = await res.json();
                         let catId = `bb-section-${cat}`; let section = document.getElementById(catId);
                         if (Object.keys(d.results).length > 0) {
                             if (!section) { section = document.createElement('div'); section.id = catId; section.className = 'card'; bb.appendChild(section); }
-                            const rankerName = rankers[cat] || "DefaultWeightedRanker";
-                            let tableHtml = `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;"><div><h2 style="display:inline; margin-right:1rem;">${cat.replace('_',' ')}</h2><div class="badge badge-ranker" style="display:inline; vertical-align:middle;">Ranker: ${rankerName}</div></div><div style="display:flex; gap:0.5rem;"><button class="btn btn-action" onclick="showBlackboardLogs('${cat}')">Audit Trail</button>${cat==='function_boundary'?'<button class="btn btn-primary btn-action" onclick=\\'visualizeBoundaries('+JSON.stringify(d.results)+')\\'>View Map</button>':''}</div></div><table><thead><tr><th>${cat==='function_boundary'?'Address':'Target'}</th><th>${cat==='function_boundary'?'End / Size':'Result'}</th><th>Action</th></tr></thead><tbody>`;
-                            for(let k in d.results) { 
+                            const rankerName = rankers[cat] || "Baseline";
+                            let tableHtml = `<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem;"><div><h2 style="display:inline; margin-right:1rem;">${catLabel(cat)}</h2><div class="badge badge-ranker" style="display:inline; vertical-align:middle;">Ranker: ${rankerName}</div></div><div style="display:flex; gap:0.5rem;"><button class="btn btn-action" onclick="showBlackboardLogs('${cat}')">Audit Trail</button></div></div><table><thead><tr><th>Function</th><th>Result</th><th>Detail</th></tr></thead><tbody>`;
+                            for(let k in d.results) {
                                 const item = d.results[k]; const top = item.hypotheses[0];
                                 const validators = top.validators || [];
                                 const vCount = validators.length;
-                                let resText = cat === 'function_boundary' ? `${top.data.end} (${top.data.size}b)` : (typeof top.data === 'string' ? top.data : JSON.stringify(top.data).substring(0,30)+'...');
+                                const data = top.data || {};
+                                let resText = (typeof top.data === 'string') ? top.data
+                                    : (data.known_function || data.recovered_expression
+                                       || (data.explanation ? (data.explanation.split('\n').find(l=>l.trim()) || '') : '')
+                                       || JSON.stringify(data).substring(0,40)+'...');
+                                resText = String(resText).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
                                 const vList = vCount ? `Vouched by: ${validators.join(', ')}` : 'No validations yet';
-                                tableHtml += `<tr class="bb-row"><td><code>${k}</code></td><td style="color:var(--accent); font-weight:500;">${vCount ? '<span style="color:var(--success); margin-right:0.3rem;" title="'+vList+'">✓</span>' : ''}${resText}</td><td>${cat==='cfg_generation'?'<button class="btn btn-primary btn-action" onclick="showConsensus(\\''+cat+'\\',\\''+k+'\\')">Visual Graph</button>':''} <span style="font-size:0.6rem; color:var(--muted)">via ${top.backend}${vCount ? ` <span style="color:var(--success); cursor:help;" title="${vList}">+${vCount} vouches</span>` : ''} (Score: ${top.score})</span></td></tr>`; 
+                                tableHtml += `<tr class="bb-row"><td><code>${k}</code></td><td style="color:var(--accent); font-weight:500;">${vCount ? '<span style="color:var(--success); margin-right:0.3rem;" title="'+vList+'">✓</span>' : ''}${resText}</td><td><button class="btn btn-primary btn-action" onclick="showExplanation('${cat}','${k}')">Details</button> <span style="font-size:0.6rem; color:var(--muted)">via ${top.backend}${vCount ? ` <span style="color:var(--success); cursor:help;" title="${vList}">+${vCount} vouches</span>` : ''} (Score: ${top.score})</span></td></tr>`;
                             }
                             tableHtml += '</tbody></table>';
                             if (section.innerHTML !== tableHtml) { section.innerHTML = tableHtml; section.style.animation = 'glow-pulse 0.5s ease-out'; }
@@ -745,18 +795,22 @@ class XbinOrchestratorServicer(orchestrator_pb2_grpc.OrchestratorServiceServicer
     def RegisterWorker(self, request, context):
         r.hset("xbin:active_workers", request.worker_id, f"{request.analysis_type}:{request.backend_name}")
         r.hset("xbin:worker_health", request.worker_id, json.dumps({
-            "backend": request.backend_name, 
-            "last_heartbeat": time.time(), 
+            "backend": request.backend_name,
+            "last_heartbeat": time.time(),
             "message": "Welcome Signal Received",
             "is_validator": request.is_validator,
-            "is_ranker": request.is_ranker
+            "is_ranker": request.is_ranker,
+            "display_name": request.display_name,
+            "description": request.description
         }))
-        
+
         # Persist type status in long-term plugin state
         state_key = f"xbin:plugin_state:{request.analysis_type}:{request.backend_name}"
         state = json.loads(r.get(state_key)) if r.exists(state_key) else {"status": "RUNNING"}
         state["is_validator"] = request.is_validator
         state["is_ranker"] = request.is_ranker
+        if request.display_name: state["display_name"] = request.display_name
+        if request.description: state["description"] = request.description
         r.set(state_key, json.dumps(state))
 
         type_str = "[VALIDATOR]" if request.is_validator else "[RANKER]" if request.is_ranker else ""

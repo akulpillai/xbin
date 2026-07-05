@@ -14,6 +14,8 @@ message RegisterRequest {
   string analysis_type = 3;
   bool is_validator = 4;
   bool is_ranker = 5; // NEW: Distinguish ranker plugins
+  string display_name = 6; // Human-friendly label for the dashboard (falls back to backend_name)
+  string description = 7;  // Short blurb describing what the analysis does
 }
 
 message RegisterResponse {

@@ -1,5 +1,0 @@
-# Presence of this file tells the xbin orchestrator NOT to build this plugin.
-# The image is built out-of-band, once, by ./build.sh (it extends a heavy
-# Binary Ninja base the orchestrator cannot build). On start the orchestrator
-# reuses the existing image: xbin-plugin-symbol_matching-equation_recovery.
-# Rebuild: re-run ./build.sh, or `docker rmi xbin-plugin-symbol_matching-equation_recovery`.

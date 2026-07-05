@@ -38,12 +38,17 @@ class TaskContext:
     raw_bytes: bytes
 
 class Worker:
-    def __init__(self, name: str, category: str, version: str, is_validator: bool = False, is_ranker: bool = False):
+    def __init__(self, name: str, category: str, version: str, is_validator: bool = False, is_ranker: bool = False,
+                 display_name: str = "", description: str = ""):
         self.name = name
         self.category = category
         self.version = version
         self.is_validator = is_validator
         self.is_ranker = is_ranker
+        # Human-friendly label + blurb shown in the dashboard. display_name falls
+        # back to the technical backend name when not set.
+        self.display_name = display_name or name
+        self.description = description
         self.worker_id = f"{name}-{uuid.uuid4().hex[:8]}"
         
         self.on_binary_handler = None
@@ -91,9 +96,10 @@ class Worker:
         print(f"[*] Connecting to {self.orchestrator_addr}...")
         try:
             resp = self._stub.RegisterWorker(orchestrator_pb2.RegisterRequest(
-                worker_id=self.worker_id, backend_name=self.name, 
+                worker_id=self.worker_id, backend_name=self.name,
                 analysis_type=self.category, is_validator=self.is_validator,
-                is_ranker=self.is_ranker
+                is_ranker=self.is_ranker, display_name=self.display_name,
+                description=self.description
             ))
             if resp.success:
                 print(f"[+] READY: Registered with ID {self.worker_id}")
@@ -103,13 +109,17 @@ class Worker:
             print(f"[ERROR] Connection failed: {e}")
             return False
 
-    def post_result(self, item_key: str, data: Any, confidence: float):
+    def post_result(self, item_key: str, data: Any, confidence: float, category: Optional[str] = None):
+        # `category` defaults to the worker's own category, but a worker may post
+        # to a different blackboard (e.g. bind_se posts semantics to
+        # equation_recovery and an identity match to signature_matching).
+        target_cat = category or self.category
         try:
             self._stub.PostResult(orchestrator_pb2.PostResultRequest(
-                analysis_type=self.category, item_key=item_key,
+                analysis_type=target_cat, item_key=item_key,
                 result_data=json.dumps(data), confidence=confidence, backend_name=self.name
             ))
-            print(f"[>] Result posted for {item_key} (Conf: {confidence})")
+            print(f"[>] Result posted for {item_key} in {target_cat} (Conf: {confidence})")
         except Exception as e:
             print(f"[ERROR] Post failed for {item_key}: {e}")
 
@@ -178,9 +188,10 @@ class Worker:
 
 _current_worker: Optional[Worker] = None
 
-def plugin(name: str, category: str, version: str = "1.0", is_validator: bool = False, is_ranker: bool = False):
+def plugin(name: str, category: str, version: str = "1.0", is_validator: bool = False, is_ranker: bool = False,
+           display_name: str = "", description: str = ""):
     global _current_worker
-    _current_worker = Worker(name, category, version, is_validator, is_ranker)
+    _current_worker = Worker(name, category, version, is_validator, is_ranker, display_name, description)
     def decorator(cls):
         try:
             instance = cls()
@@ -203,9 +214,9 @@ def start_worker():
     else:
         print("[ERROR] No plugin defined. Use @xbin.plugin.")
 
-def post_result(item_key: str, data: Any, confidence: float):
+def post_result(item_key: str, data: Any, confidence: float, category: Optional[str] = None):
     if _current_worker:
-        _current_worker.post_result(item_key, data, confidence)
+        _current_worker.post_result(item_key, data, confidence, category)
     else:
         print("[ERROR] No active worker. Call @xbin.plugin first.")
 
