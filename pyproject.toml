@@ -30,3 +30,13 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Default lane is Docker-free: exclude the full-stack e2e test. Run it with
+# `pytest -m e2e` (a user-supplied -m overrides this default).
+addopts = "-ra -m 'not e2e'"
+markers = [
+    "e2e: full-stack pipeline; needs Docker + bind:latest (+ ollama for full/heavy). Opt-in.",
+    "slow: long-running (minutes to hours).",
+]

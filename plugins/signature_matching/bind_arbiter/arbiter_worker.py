@@ -16,7 +16,7 @@ import json
 import os
 
 import xbin
-from xbin.sdk import _current_worker
+import xbin.sdk as _sdk
 from xbin.bind_helpers import CAT_SIGNATURE, CAT_EQUATION
 
 _LLM_MODE = os.environ.get("BIND_ARBITER_LLM_MODE", "on-conflict")  # always | on-conflict | never
@@ -44,7 +44,7 @@ class BindArbiter:
     def _arbitrate(self, category, item_key):
         from bind_jobs.arbiter_core import classify
 
-        w = _current_worker
+        w = _sdk._current_worker
         raw = w._redis.get(f"xbin:bb:{category}:{item_key}")
         if not raw:
             return

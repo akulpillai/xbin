@@ -72,7 +72,7 @@ mkdir "$BUILD_CTX/Morpheus"
 tar -C "$MORPHEUS_DIR" \
     --exclude='./.git' \
     --exclude='./qemu' \
-    --exclude='./ghidra_*' \
+    --exclude='./ghidra_[0-9]*' \
     --exclude='./.claude' \
     --exclude='./docker/binaryninja' \
     --exclude='./docker/license.dat' \

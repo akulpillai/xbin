@@ -109,7 +109,12 @@ def cleanup_stale_plugins():
 # ==========================================
 app = FastAPI(title="xbin Multi-Analysis Orchestrator", version="1.8.0")
 
-if not os.path.exists(UPLOAD_DIR): os.makedirs(UPLOAD_DIR)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+# uploads/ is bind-mounted into every worker container, but the workers run as a
+# different uid (bind=1000) and cache sidecars (<bin>.setup_end, <bin>.bndb) next
+# to the firmware. Make it world-writable so bind_se/symbolic_regression can run.
+try: os.chmod(UPLOAD_DIR, 0o777)
+except OSError: pass
 
 def get_container_name(name: str, category: str):
     return f"xbin-worker-{category.strip()}-{name.strip()}"

@@ -9,7 +9,6 @@ address, competing with ghidriff / bind_se).
 import os
 
 import xbin
-from xbin.sdk import _current_worker
 from xbin.bind_helpers import CAT_SIGNATURE, prepare_config
 
 
@@ -41,7 +40,7 @@ class FidPlugin:
             if res.get("status") != "success":
                 continue
             payload = res["payload"]
-            _current_worker.post_result(
+            xbin.post_result(
                 item_key=norm_addr(addr),
                 data=payload,
                 confidence=float(payload.get("confidence") or 0.0),

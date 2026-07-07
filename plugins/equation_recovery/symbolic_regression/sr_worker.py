@@ -10,7 +10,6 @@ and posts each recovered formula to the ``equation_recovery`` blackboard
 import os
 
 import xbin
-from xbin.sdk import _current_worker
 from xbin.bind_helpers import CAT_EQUATION, prepare_config, function_universe
 
 
@@ -54,7 +53,7 @@ class SymbolicRegressionPlugin:
                 continue
             out_dir = (res.get("payload") or {}).get("output_dir")
             analysis = read_sr_analysis(out_dir)
-            _current_worker.post_result(
+            xbin.post_result(
                 item_key=func,
                 data={
                     "recovered_expression": _first_line(analysis),

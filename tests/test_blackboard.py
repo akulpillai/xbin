@@ -13,7 +13,7 @@ def wait_for_key(redis_client, key, timeout=2.0):
     return None
 
 def test_analyzer_submission(clean_redis):
-    cat = 'function_boundary'
+    cat = 'signature_matching'
     item = '0x1000'
     
     analyzer = Worker(name='test_analyzer', category=cat, version='1.0')
@@ -29,7 +29,7 @@ def test_analyzer_submission(clean_redis):
     assert state['hypotheses'][0]['score'] == 0.5  # 1.0 conf * 0.5 default weight
 
 def test_validator_vouching(clean_redis):
-    cat = 'function_boundary'
+    cat = 'signature_matching'
     item = '0x1001'
     
     # 1. Setup Analyzer
@@ -54,7 +54,7 @@ def test_validator_vouching(clean_redis):
     assert state['hypotheses'][0]['score'] == 1.0 # 0.5 initial + 0.5 boost from validator
 
 def test_ranker_update(clean_redis):
-    cat = 'function_boundary'
+    cat = 'signature_matching'
     item = '0x1002'
     
     # 1. Submit initial result
