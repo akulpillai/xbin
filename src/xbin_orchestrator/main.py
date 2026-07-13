@@ -41,6 +41,17 @@ PLUGIN_DIRS = [DEFAULT_PLUGINS_DIR]
 EXPLICIT_PLUGINS = []
 UPLOAD_DIR = "uploads"
 
+# Generic worker env passthrough: forward an operator-specified allowlist of env
+# vars from the orchestrator's environment into every worker container (via
+# `docker run -e`) when they are set. Empty by default (nothing forwarded), so
+# behaviour is unchanged unless configured. Set XBIN_WORKER_ENV_PASSTHROUGH to a
+# comma-separated list to enable -- e.g. to tune a plugin's worker knobs at fleet
+# start without rebuilding its image. Deliberately plugin-agnostic: no plugin- or
+# tool-specific variable names live in the orchestrator core.
+WORKER_ENV_PASSTHROUGH = tuple(
+    v.strip() for v in os.getenv("XBIN_WORKER_ENV_PASSTHROUGH", "").split(",") if v.strip()
+)
+
 # Per-backend consensus weights (multiplied into each result's raw confidence).
 # The four BIND tools + the ollama arbiter. Signature matchers (fid/ghidriff)
 # produce high-precision identity matches, so they carry more weight than the
@@ -385,7 +396,13 @@ def bg_start_plugin(name: str, category: str):
         set_plugin_state(name, category, "STARTING")
         subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
         abs_uploads = os.path.abspath(UPLOAD_DIR)
-        run_cmd = ["docker", "run", "-d", "--name", container_name, "--network", "host", "-v", f"{abs_uploads}:/app/uploads", "-e", "XBIN_ORCHESTRATOR=localhost:50051", "-e", "REDIS_HOST=localhost", "-e", "PYTHONUNBUFFERED=1", image_name]
+        run_cmd = ["docker", "run", "-d", "--name", container_name, "--network", "host", "-v", f"{abs_uploads}:/app/uploads", "-e", "XBIN_ORCHESTRATOR=localhost:50051", "-e", "REDIS_HOST=localhost", "-e", "PYTHONUNBUFFERED=1"]
+        # Forward opt-in worker tunables (e.g. the bind_se fork-guard caps) when set.
+        for _var in WORKER_ENV_PASSTHROUGH:
+            _val = os.environ.get(_var)
+            if _val is not None:
+                run_cmd += ["-e", f"{_var}={_val}"]
+        run_cmd.append(image_name)
         subprocess.run(run_cmd, check=True, stdout=subprocess.DEVNULL)
     except Exception as e:
         sys_log(f"Fail {name}: {e}"); set_plugin_state(name, category, "ERROR", error=str(e))
