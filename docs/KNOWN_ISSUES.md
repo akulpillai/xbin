@@ -14,6 +14,17 @@ and running the full pipeline against `submodules/Morpheus/example_config/gs3.bi
   `equation_recovery` = 489 functions (symbolic_regression 487 + bind_se 2).
 - Environment: `bind:latest` rebuilt to include the QEMU/FastDyn stack; Python
   env via rye `cpython@3.12.9` venv (`make setup`).
+- **bind_se focused verification** (issues A + B below), on a smaller target:
+  **Betaflight 4.5.1, STM32F411** unified target
+  (<https://github.com/betaflight/betaflight/releases/tag/4.5.1>, asset
+  `betaflight_4.5.1_STM32F411.hex`, sha256
+  `5391158fefe97959c449d05c1b3b3fe30c6e6b7594568637a9233a2ed3cd4abc`), converted
+  to a raw blob via `arm-none-eabi-objcopy -I ihex -O binary` (473,405 B, sha256
+  `d9e463cd2239b8b8c661939c15a42dbf1be6ff6850be5cdfc16c7d47c13e17fd`, load base
+  `0x08000000`). Kept in `uploads/` (gitignored); **not committed**. bind_se
+  `setup()` completed, analyzed **982** functions, posted to `equation_recovery`
+  with **0** `not in target CFG` misses, worker memory bounded (~0.5 GiB; no
+  ~47 GiB runaway).
 
 ---
 
@@ -51,55 +62,104 @@ The base image lacked `qemu-system-arm` + `libvirtual.so`, so symbolic_regressio
 `scripts/rebuild_bind_base.sh` (kills the outdated running instance first, then
 delegates to `build_bind_base.sh`, prunes, and verifies QEMU is present).
 
+### 5. bind_se `setup()` CFG runaway on large firmware (was Open A) — FIXED
+`BindSeClient.setup()` built the **target** angr CFG with
+`CFGFast(force_complete_scan=True)`
+(`submodules/Morpheus/bind_jobs/clients/bind_se_client.py`). On a multi-MB blob
+that does an exhaustive linear sweep (every address a candidate function start)
+and exploded memory/time — **~47 GiB, one core pegged, no progress** — stalling
+*before* the per-function loop. `force_complete_scan` was **not required**: its
+only job (guarantee every BN∩Ghidra job address is a CFG node so
+`get_by_addr` doesn't `KeyError`) is done precisely and cheaply by seeding the
+CFG with those addresses.
+**Fix:**
+- `bind_se_client.py`: `setup(function_starts=None)` builds the target CFG as
+  `CFGFast(function_starts=function_starts or [], force_complete_scan=bool(config.get("se_target_force_complete_scan", False)), …)`.
+  Default `False`; the `se_target_force_complete_scan` key (documented in
+  `bind_config.toml`) can re-enable the exhaustive scan.
+- `bind_se_worker.py`: computes the BN∩Ghidra universe **before** `setup()` and
+  passes Thumb-decorated starts (`int(addr,16) | 1`, to match
+  `get_by_addr(addr | 1)` on Cortex-M).
+**Verified** on Betaflight 4.5.1 STM32F411 (see Verification status): target CFG
+built in ~34 s at ~2.5 GiB (isolated probe: 2648 → 2783 functions *with* the
+seed, i.e. seeding *raised* coverage), setup() completed, loop analyzed 982
+functions with **0** `not in target CFG` misses.
+Deployed to the running `bind:latest` via a COPY-layer patch of the two edited
+Morpheus files; a `scripts/rebuild_bind_base.sh --force` will bake the corrected
+submodule source in durably.
+
+### 6. bind_se fork-after-threads deadlock in setup / guard — FIXED
+Surfaced while fixing #5: `function_universe()` loads Binary Ninja **and** an
+in-process Ghidra JVM (≈118 threads) into the worker. `setup()`'s fork-based
+reference sig generation (`sigmatch._generate_sigs_with_cache` → `Process(...)`)
+and the per-function fork guard (#7) then fork a heavily multithreaded process →
+classic **fork-after-threads deadlock** (child inherits mutexes locked by threads
+that don't exist in it; observed as an idle-CPU stall, worker never progresses).
+Computing `function_universe` before `setup()` (needed for #5) made this hit
+reference generation; the same hazard already made the guard unforkable.
+**Fix:** `bind_se_worker._function_universe_isolated()` runs the universe
+computation in a throwaway subprocess, so the JVM/BN threads never live in the
+worker — every subsequent `fork()` is clean. Verified: after the subprocess
+exits the worker drops to ~0.3 GiB, reference sig-gen completes, and both the
+sig-gen fork and the guard fork run without stalling.
+
+### 7. bind_se per-function loop unbounded (was Open B) — FIXED / VERIFIED
+`handle()` → `_gen_target_signature` → `gen_signature` runs angr symbolic
+execution with no time/memory bound (`sigmatch_timeout` only guards setup-phase
+reference generation). The per-function fork guard in `bind_se_worker.py` runs
+each `handle(func)` in a child with a wall-clock timeout + `RLIMIT_AS` cap
+(`BIND_SE_FUNC_TIMEOUT` default 90 s, `BIND_SE_FUNC_MEM_GB` default 24). It was
+previously unverifiable (issue #5 blocked reaching the loop) **and** latently
+broken (issue #6 fork deadlock). Now:
+- The orchestrator forwards an operator-specified env allowlist to worker
+  containers (`XBIN_WORKER_ENV_PASSTHROUGH`, generic — no plugin-specific names
+  in the core), so `BIND_SE_FUNC_TIMEOUT` / `BIND_SE_FUNC_MEM_GB` are tunable at
+  fleet start. **Committed separately** as the Issue-B enabling feature.
+- `_se_child` resets inherited SIGTERM/SIGINT to `SIG_DFL` so the guard's
+  `terminate()` kills the child cleanly (no misleading "Shutdown signal 15" +
+  weakref traceback, and no SIGTERM swallowing).
+**Verified** with `BIND_SE_FUNC_TIMEOUT=1` on the Betaflight target: the loop ran
+at `per-func cap: 1s`, the guard reported repeated `0x…: timeout (skipped)`, the
+worker **survived and continued**, and after the signal reset the kill logs are
+clean (0 "Shutdown signal 15", 0 tracebacks).
+
 ---
 
 ## Open
 
-### A. bind_se `setup()` CFG runaway on large firmware — OPEN (primary blocker)
-`BindSeClient.setup()` builds the **target** angr CFG with
-`CFGFast(force_complete_scan=True)`
-(`submodules/Morpheus/bind_jobs/clients/bind_se_client.py`). On a multi-MB blob
-this does an exhaustive linear sweep (every address a candidate function start)
-and explodes memory/time — observed **~47 GiB, one core pegged, no progress**,
-stalling *before* bind_se reaches its per-function loop. (It did complete this
-phase in the 39 h run and posted 2, so it is heavy-but-not-strictly-broken.)
-
-**Proposed fix (not yet applied):** make the target CFG's `force_complete_scan`
-config-driven and default it to `False` (matching the reference-binary CFGs),
-e.g. `force_complete_scan=bool(config.get("se_target_force_complete_scan", False))`.
-Deploy via a COPY-layer patch of `bind_se_client.py` (fast) and/or a
-`bind:latest` rebuild (durable). **Unverified tradeoff:** the lighter recursive
-scan may recover fewer functions (some `function_universe` addresses may be
-absent from the CFG → `get_by_addr` KeyError → skipped). If coverage drops too
-far, pass the known BN∩Ghidra addresses to `CFGFast(function_starts=...)` for
-cheap-and-complete coverage (requires computing `function_universe` before
-`setup()` and threading the addresses in).
-
-### B. bind_se per-function loop unbounded — MITIGATED (unverified)
-`handle()` → `_gen_target_signature` → `gen_signature` runs angr symbolic
-execution with no time/memory bound (`self.timeout`/`sigmatch_timeout` only
-guards setup-phase reference generation). A single pathological function can spin
-tens of minutes and balloon memory.
-**Mitigation (implemented, not yet exercised):** a per-function fork guard in
-`plugins/equation_recovery/bind_se/bind_se_worker.py` runs each `handle(func)` in
-a child with a wall-clock timeout + address-space cap (`BIND_SE_FUNC_TIMEOUT`
-default 90s, `BIND_SE_FUNC_MEM_GB` default 24). It could not be verified end-to-end
-because issue A blocks reaching the loop on `gs3.bin`; verify once A is resolved.
+### A. bind_se reference signature generation is slow / coarsely bounded — NOTE
+`setup()` generates SMT2 signatures for every function of the reference binary
+(`_generate_sigs_with_cache`), bounded only by a single `sigmatch_timeout`
+(default 7200 s). On the baked 3.6 MB `arducopter_cubeorange_default` reference
+this "routinely hits the 2h cap" (per the sigmatch code comment) and saves a
+partial set. It is CPU-bound slow-compute (now that #6 is fixed), not broken, but
+it dominates `setup()` wall-clock on a full run. The Betaflight verification above
+used a **tiny custom reference** (a 4-function Cortex-M ELF as the
+`<stem>.reference` sibling) to keep reference gen to seconds; a production run
+against a real reference should expect the long reference-gen phase (or a
+pre-warmed sig cache). Not caused by the #5/#6 fixes.
 
 ### C. bind_se low yield — NOTE
-Even past setup, bind_se posted only 2 hypotheses in ~39 h, whereas
+Even past setup, bind_se posted only 2 hypotheses in ~39 h on `gs3.bin`, whereas
 symbolic_regression robustly covered `equation_recovery` (487 formulas). Treat
 bind_se as best-effort / secondary on large firmware; symbolic_regression is the
-practical `equation_recovery` producer.
+practical `equation_recovery` producer. (With #5/#6 fixed, bind_se now reaches
+and works through its per-function loop far more readily — it posted steadily on
+the Betaflight target — but this note stands for large firmware.)
 
 ---
 
 ## Notes for future rebuilds
 
 - The `bind:latest` running image carries COPY-layer patches (ghidra_scripts, and
-  any future bind_se_client patch). A full `scripts/rebuild_bind_base.sh --force`
-  rebuilds from the submodule and bakes in the corrected `build_bind_base.sh`
-  exclude; re-apply any submodule source edits there so they persist.
+  the issue-#5 `bind_se_client.py` + `bind_config.toml` patch). The #5 patch was
+  applied as a fast `FROM bind:latest` COPY layer re-tagged `bind:latest` (the
+  Dockerfile's `COPY Morpheus` sits *before* the QEMU-from-source build, so a full
+  rebuild would rebuild QEMU/Ghidra/BN just for a 2-file source patch). A
+  `scripts/rebuild_bind_base.sh --force` rebuilds from the submodule and bakes the
+  corrected source in durably; re-apply any submodule source edits there so they
+  persist. (The `bind_se_worker.py` fixes live in the plugin dir and are baked into
+  the `xbin-plugin-*` thin layer on every fleet start, so they need no base rebuild.)
 - Editing files under `submodules/Morpheus/` creates a local submodule diff; a
   later `git submodule update` may reset it. Track intended Morpheus changes
   upstream (purseclab/Morpheus, `integration` branch) or re-apply after updates.

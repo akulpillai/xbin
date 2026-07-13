@@ -10,6 +10,16 @@ It answers two questions, so it posts to two blackboards:
   * ``signature_matching``  -- an identity, when SE matched a known reference
     signature (competes with fid / ghidriff).
 
+Setup guard: BindSeClient.setup() builds the target angr CFG. We compute the
+BN/Ghidra function universe up front and pass it as ``function_starts`` so the
+CFG covers every job address without ``force_complete_scan``'s exhaustive linear
+sweep (which explodes to tens of GB on multi-MB firmware). The exhaustive scan
+can be re-enabled via the ``se_target_force_complete_scan`` config key. The
+universe is computed in a subprocess (``_function_universe_isolated``) because it
+loads the Ghidra JVM + Binary Ninja; keeping their threads out of this process is
+what lets the reference-sig-gen fork and the per-function fork guard run without
+a fork-after-threads deadlock.
+
 Per-function guard: BindSeClient.handle() runs angr symbolic execution with no
 time or memory bound, so a single pathological function can spin for tens of
 minutes and balloon memory to tens of GB (stalling the whole run / risking OOM).
@@ -20,15 +30,55 @@ when the child exits. Tunables (env):
   BIND_SE_FUNC_MEM_GB   per-function RLIMIT_AS cap in GB, 0 disables (default 24)
 """
 
+import json as _json
 import multiprocessing as _mp
 import os
 import queue as _queue
+import subprocess as _subprocess
+import sys as _sys
+import tempfile as _tempfile
 
 import xbin
-from xbin.bind_helpers import CAT_EQUATION, CAT_SIGNATURE, prepare_config, function_universe
+from xbin.bind_helpers import CAT_EQUATION, CAT_SIGNATURE, prepare_config
 
 _FUNC_TIMEOUT = int(os.environ.get("BIND_SE_FUNC_TIMEOUT", "90"))
 _FUNC_MEM_GB = float(os.environ.get("BIND_SE_FUNC_MEM_GB", "24"))
+
+
+def _function_universe_isolated(config_path):
+    """Compute the BN∩Ghidra function universe in a throwaway subprocess.
+
+    ``function_universe()`` loads Binary Ninja and an in-process Ghidra JVM, each
+    of which spawns dozens of long-lived threads. If those threads live in *this*
+    (the worker) process, the fork-based reference signature generation inside
+    ``BindSeClient.setup()`` and the per-function fork guard below would fork a
+    heavily multithreaded process and deadlock -- a classic fork-after-threads
+    hang: the child inherits mutexes locked by threads that do not exist in it,
+    so the first allocation/lock in the child blocks forever (observed as an
+    idle-CPU stall). Running the universe computation in its own short-lived
+    process keeps this process free of the JVM/BN threads, so every subsequent
+    fork() is clean. The child's stdout/stderr flow through so the
+    ``[binja]``/``[ghidra]`` progress stays visible; the result comes back via a
+    temp file.
+    """
+    fd, out_path = _tempfile.mkstemp(suffix=".json", prefix="xbin_universe_")
+    os.close(fd)
+    code = (
+        "import json, sys; from xbin.bind_helpers import function_universe; "
+        "open(sys.argv[2], 'w').write(json.dumps(function_universe(sys.argv[1])))"
+    )
+    try:
+        proc = _subprocess.run([_sys.executable, "-c", code, config_path, out_path])
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"function_universe subprocess exited {proc.returncode}")
+        with open(out_path) as f:
+            return _json.load(f)
+    finally:
+        try:
+            os.remove(out_path)
+        except OSError:
+            pass
 
 
 def _se_child(client, func, q):
@@ -37,6 +87,18 @@ def _se_child(client, func, q):
     Runs in a forked child (inherits the parent's loaded CFG/refs copy-on-write),
     so an address-space cap and a hard kill bound this one function only.
     """
+    # Reset the SIGTERM/SIGINT handlers inherited from the worker parent. The SDK
+    # installs a graceful-shutdown handler (sdk._handle_exit) that this forked
+    # child would otherwise run when the guard's p.terminate() kills it on
+    # timeout -- emitting a misleading "Shutdown signal 15 received" line plus a
+    # weakref-cleanup traceback, and even swallowing the SIGTERM (forcing the
+    # SIGKILL escalation). Default handling makes the timeout kill clean.
+    import signal as _signal
+    for _s in (_signal.SIGTERM, _signal.SIGINT):
+        try:
+            _signal.signal(_s, _signal.SIG_DFL)
+        except (ValueError, OSError):
+            pass
     try:
         if _FUNC_MEM_GB > 0:
             import resource
@@ -94,11 +156,21 @@ class BindSePlugin:
         timeout = int(config.get("sigmatch_timeout", 7200))
         client = BindSeClient("http://unused", out, config, os.path.join(out, "cache"), timeout=timeout)
 
+        # Compute the BN/Ghidra function universe *before* setup() so we can seed
+        # the target CFG with these starts. This lets setup() drop the exhaustive
+        # force_complete_scan linear sweep (the ~47 GiB runaway on large firmware)
+        # while still guaranteeing every job address is a CFG node. Thumb bit set
+        # (`| 1`) to match handle()'s get_by_addr(addr | 1) lookup on Cortex-M.
+        # Run it in an isolated subprocess (see _function_universe_isolated): it
+        # loads the Ghidra JVM + Binary Ninja, whose threads would otherwise make
+        # every later fork() in this process deadlock.
+        funcs = _function_universe_isolated(config_path)
+        starts = [int(f, 16) | 1 for f in funcs]
+
         print(f"[bind_se] loading references + target CFG for {os.path.basename(binary_path)} ...")
-        client.setup()
+        client.setup(function_starts=starts)
 
         ctx = _mp.get_context("fork")
-        funcs = function_universe(config_path)
         print(f"[bind_se] analyzing {len(funcs)} functions with symbolic execution "
               f"(per-func cap: {_FUNC_TIMEOUT}s / {_FUNC_MEM_GB}GB) ...")
         eq_posted = id_posted = 0
