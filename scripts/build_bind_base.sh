@@ -52,6 +52,10 @@ fi
 [[ -n "$LICENSE"   && -f "$LICENSE"   ]] || { echo "license.dat not found: '$LICENSE' (set it in scripts/build.conf or pass as arg 2)" >&2; exit 1; }
 
 # --- Stage the build context (Dockerfile COPYs Morpheus/, binaryninja/, license.dat) ---
+# Keep the (large) staging context off the small root /tmp: default TMPDIR to a
+# repo-local scratch dir on the big disk unless the caller already set one.
+export TMPDIR="${TMPDIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.xbin_scratch}"
+mkdir -p "$TMPDIR"
 BUILD_CTX="$(mktemp -d -t bind-build-XXXXXX)"
 trap 'rm -rf "$BUILD_CTX"' EXIT
 

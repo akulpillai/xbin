@@ -56,3 +56,6 @@ appendonly.aof
 tests/.orchestrator.log
 e2e_*.log
 orchestrator_*.log
+
+# Repo-local scratch on the big disk (build staging, orchestrator temp/log)
+.xbin_scratch/

@@ -41,6 +41,20 @@ PLUGIN_DIRS = [DEFAULT_PLUGINS_DIR]
 EXPLICIT_PLUGINS = []
 UPLOAD_DIR = "uploads"
 
+# Scratch/temp on the big disk, NOT root. This server's /tmp lives on the small
+# root filesystem (~50G free); the repo (and Docker's data-root) live on the
+# multi-TB /evaldisk. Point every host-side tempfile (the plugin build staging in
+# _build_plugin_image, bind_helpers' config temps, etc.) at a repo-local scratch
+# dir so a build or run can never fill root. Container-internal scratch already
+# lands on evaldisk via Docker's data-root. Override with XBIN_TMPDIR if desired.
+SCRATCH_DIR = os.getenv("XBIN_TMPDIR") or os.path.abspath(".xbin_scratch")
+try:
+    os.makedirs(SCRATCH_DIR, exist_ok=True)
+    os.environ["TMPDIR"] = os.environ["TMP"] = os.environ["TEMP"] = SCRATCH_DIR
+    tempfile.tempdir = SCRATCH_DIR
+except OSError:
+    pass  # fall back to the system default rather than refusing to start
+
 # Generic worker env passthrough: forward an operator-specified allowlist of env
 # vars from the orchestrator's environment into every worker container (via
 # `docker run -e`) when they are set. Empty by default (nothing forwarded), so
