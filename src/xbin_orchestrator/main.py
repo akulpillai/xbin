@@ -16,6 +16,7 @@ import argcomplete
 
 import grpc
 import redis
+import requests
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Form
 from fastapi.responses import HTMLResponse
 import uvicorn
@@ -36,6 +37,11 @@ except (ImportError, ValueError):
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 GRPC_PORT = "[::]:50051"
 REST_PORT = 8000
+# Local ollama endpoint used to turn raw results (SMT2 expressions / matched
+# function names) into a readable one-liner for the dashboard. Same model the
+# workers/arbiter use. Reached over --network host at 127.0.0.1.
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/v1/chat/completions")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
 DEFAULT_PLUGINS_DIR = os.getenv("XBIN_PLUGINS_DIR", "plugins")
 PLUGIN_DIRS = [DEFAULT_PLUGINS_DIR]
 EXPLICIT_PLUGINS = []
@@ -547,10 +553,113 @@ def get_blackboard_audit(analysis_type: str):
     cat = analysis_type.strip(); audit_key = f"xbin:bb_logs:{cat}"; logs = r.lrange(audit_key, 0, -1)
     return {"logs": "\n".join(logs) if logs else "No history recorded yet."}
 
+def _summary_from_explanation(data):
+    """Pull a clean one-line summary out of a worker's ollama `explanation`.
+
+    Both fid/ghidriff and bind_se already pipe their result through ollama and
+    store a markdown `explanation` beginning with a "Summary of Functionality"
+    section. Reuse that (no new LLM call) so the results table shows readable
+    text instead of raw SMT2. Falls back to the identity/first line.
+    """
+    if not isinstance(data, dict):
+        return str(data)[:200] if data is not None else ""
+    exp = data.get("explanation") or ""
+    if exp:
+        lines = [ln.strip() for ln in exp.replace("\r", "").split("\n")]
+        def _is_header(l):
+            s = l.lstrip("#* ").rstrip(":*# ").lower()
+            return l.startswith("#") or (l.startswith("**") and l.rstrip().endswith(("**", ":", "  "))) or s in (
+                "summary of functionality", "matched known function", "explanation",
+                "recovered expression", "rewritten expression", "recovered smt2")
+        # collect the block right after the "Summary of Functionality" header
+        collected, capturing = [], False
+        for ln in lines:
+            low = ln.lstrip("#* ").rstrip(":*# ").lower()
+            if "summary of functionality" in low:
+                capturing = True; continue
+            if capturing:
+                if not ln:
+                    if collected: break
+                    continue
+                if _is_header(ln):
+                    break
+                collected.append(ln.lstrip("-* ").strip())
+        text = " ".join(collected).strip()
+        if not text:  # header not found: first meaningful non-header line
+            for ln in lines:
+                if ln and not _is_header(ln):
+                    text = ln.lstrip("-* ").strip(); break
+        text = text.replace("**", "").strip()
+        if text:
+            if data.get("known_function"):
+                return f"{data['known_function']} — {text}"
+            return text
+    if data.get("known_function"):
+        return data["known_function"]
+    if data.get("recovered_expression"):
+        return "symbolic expression (open Details for the simplified form)"
+    return (json.dumps(data)[:80] + "…") if data else ""
+
+def _ollama_chat(prompt, max_tokens=200, timeout=45):
+    resp = requests.post(OLLAMA_URL, json={
+        "model": OLLAMA_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens, "temperature": 0.1, "stream": False,
+    }, timeout=timeout)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
+
 @app.get("/api/v1/blackboard/{analysis_type}/results")
 def get_analysis_results(analysis_type: str):
     keys = r.keys(f"xbin:bb:{analysis_type.strip()}:*")
-    return {"results": {k.split(":")[-1]: json.loads(r.get(k)) for k in keys}}
+    results = {}
+    for k in keys:
+        item = json.loads(r.get(k))
+        hyps = item.get("hypotheses") or []
+        # Attach a readable one-liner (reuses the worker's ollama explanation, no
+        # new LLM call) so the table never shows raw SMT2.
+        item["display_summary"] = _summary_from_explanation(hyps[0].get("data")) if hyps else ""
+        results[k.split(":")[-1]] = item
+    return {"results": results}
+
+@app.get("/api/v1/blackboard/{analysis_type}/{item_key}/summary")
+def get_result_summary(analysis_type: str, item_key: str):
+    """Pipe the top hypothesis through ollama for a concise result:
+    a simplified expression (equation_recovery) or a plain-language description
+    of the identified function (signature_matching). Cached per hypothesis id;
+    degrades gracefully to the parsed explanation if ollama is unavailable.
+    """
+    cat = analysis_type.strip()
+    state_str = r.get(f"xbin:bb:{cat}:{item_key}")
+    if not state_str:
+        raise HTTPException(status_code=404)
+    state = json.loads(state_str)
+    hyps = state.get("hypotheses") or []
+    if not hyps:
+        return {"summary": ""}
+    top = hyps[0]; data = top.get("data") or {}; hyp_id = top.get("id")
+    cache_key = f"xbin:summary:{cat}:{item_key}"
+    cached = r.get(cache_key)
+    if cached:
+        c = json.loads(cached)
+        if c.get("hyp_id") == hyp_id:
+            return {"summary": c["text"], "cached": True}
+    if isinstance(data, dict) and data.get("known_function"):
+        prompt = (f"In one or two plain sentences, describe what the function "
+                  f"'{data['known_function']}' does. No preamble, no code.")
+    elif isinstance(data, dict) and data.get("recovered_expression"):
+        prompt = ("Rewrite this SMT2 bit-vector expression as a concise, human-readable "
+                  "formula (or a one-line plain-English description of what it computes). "
+                  "Output ONLY the simplified result, no preamble, no raw SMT2:\n\n"
+                  f"{data['recovered_expression']}")
+    else:
+        return {"summary": _summary_from_explanation(data)}
+    try:
+        text = _ollama_chat(prompt)
+        r.set(cache_key, json.dumps({"hyp_id": hyp_id, "text": text}), ex=86400)
+        return {"summary": text, "cached": False}
+    except Exception as e:
+        return {"summary": _summary_from_explanation(data), "error": str(e)}
 
 @app.get("/api/v1/blackboard/{analysis_type}/{item_key}/consensus")
 def get_consensus(analysis_type: str, item_key: str):
@@ -818,13 +927,27 @@ def dashboard():
                 content.style.display='block';
                 document.getElementById('overlay').style.display='block';
                 document.getElementById('modal').style.display='flex';
-                content.innerText = 'Loading...';
+                content.innerText = 'Simplifying via ollama…';
                 try {
                     const res = await fetch(`/api/v1/blackboard/${cat}/results`);
                     const d = await res.json();
                     const entry = (d.results || {})[item];
                     if (!entry || !entry.hypotheses || !entry.hypotheses.length) { content.innerText = 'No data.'; return; }
                     const lines = [];
+                    // Headline: the ollama-simplified result (simpler expression, or a
+                    // description for a signature match). Falls back to display_summary.
+                    let simplified = entry.display_summary || '';
+                    try {
+                        const sRes = await fetch(`/api/v1/blackboard/${cat}/${encodeURIComponent(item)}/summary`);
+                        const sD = await sRes.json();
+                        if (sD.summary) simplified = sD.summary;
+                    } catch (e) {}
+                    if (simplified) {
+                        lines.push('┌─ Simplified (ollama) ' + '─'.repeat(38));
+                        lines.push(simplified);
+                        lines.push('└' + '─'.repeat(59));
+                        lines.push('');
+                    }
                     entry.hypotheses.forEach((h, i) => {
                         const data = h.data || {};
                         lines.push('='.repeat(60));
@@ -832,8 +955,8 @@ def dashboard():
                         if ((h.validators||[]).length) lines.push(`vouched by: ${h.validators.join(', ')}`);
                         if (data.known_function) lines.push(`Identity: ${data.known_function}` + (data.confidence!=null?`  (conf ${data.confidence})`:''));
                         if (data.matchers) lines.push(`Matchers: ${(data.matchers||[]).join(', ')}`);
-                        if (data.recovered_expression) lines.push(`Expression: ${data.recovered_expression}`);
                         if (data.explanation) lines.push(`\nExplanation:\n${data.explanation}`);
+                        if (data.recovered_expression) lines.push(`\nRaw SMT2:\n${data.recovered_expression}`);
                         if (data.output_dir) lines.push(`Output: ${data.output_dir}`);
                         lines.push('');
                     });
@@ -967,10 +1090,11 @@ def dashboard():
                                 const validators = top.validators || [];
                                 const vCount = validators.length;
                                 const data = top.data || {};
-                                let resText = (typeof top.data === 'string') ? top.data
-                                    : (data.known_function || data.recovered_expression
-                                       || (data.explanation ? (data.explanation.split('\n').find(l=>l.trim()) || '') : '')
-                                       || JSON.stringify(data).substring(0,40)+'...');
+                                // Prefer the server-computed readable summary (ollama-derived);
+                                // never show raw SMT2 in the results table.
+                                let resText = item.display_summary
+                                    || ((typeof top.data === 'string') ? top.data
+                                        : (data.known_function || JSON.stringify(data).substring(0,40)+'...'));
                                 resText = String(resText).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
                                 const vList = vCount ? `Vouched by: ${validators.join(', ')}` : 'No validations yet';
                                 tableHtml += `<tr class="bb-row"><td><code>${k}</code></td><td style="color:var(--accent); font-weight:500;">${vCount ? '<span style="color:var(--success); margin-right:0.3rem;" title="'+vList+'">✓</span>' : ''}${resText}</td><td><button class="btn btn-primary btn-action" onclick="showExplanation('${cat}','${k}')">Details</button> <span style="font-size:0.6rem; color:var(--muted)">via ${top.backend}${vCount ? ` <span style="color:var(--success); cursor:help;" title="${vList}">+${vCount} vouches</span>` : ''} (Score: ${top.score})</span></td></tr>`;
