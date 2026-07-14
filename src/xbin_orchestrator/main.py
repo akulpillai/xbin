@@ -40,6 +40,12 @@ DEFAULT_PLUGINS_DIR = os.getenv("XBIN_PLUGINS_DIR", "plugins")
 PLUGIN_DIRS = [DEFAULT_PLUGINS_DIR]
 EXPLICIT_PLUGINS = []
 UPLOAD_DIR = "uploads"
+# Server-side library of symbolized reference binaries (betaflight, arducopter,
+# ...). The user picks one from a dropdown instead of uploading a reference every
+# time; the chosen file is copied to uploads/<target-stem>.reference so the BIND
+# plugins pick it up via bind_helpers.sibling(). Drop more *.reference ELFs here
+# to extend the menu.
+REFERENCE_DIR = "references"
 
 # Scratch/temp on the big disk, NOT root. This server's /tmp lives on the small
 # root filesystem (~50G free); the repo (and Docker's data-root) live on the
@@ -135,6 +141,7 @@ def cleanup_stale_plugins():
 app = FastAPI(title="xbin Multi-Analysis Orchestrator", version="1.8.0")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(REFERENCE_DIR, exist_ok=True)
 # uploads/ is bind-mounted into every worker container, but the workers run as a
 # different uid (bind=1000) and cache sidecars (<bin>.setup_end, <bin>.bndb) next
 # to the firmware. Make it world-writable so bind_se/symbolic_regression can run.
@@ -169,18 +176,52 @@ def get_health():
         })
     return {"orchestrator": "HEALTHY", "worker_fleet": workers}
 
+def list_references():
+    """Reference binaries available in the server-side library (name -> path)."""
+    refs = {}
+    try:
+        for fn in sorted(os.listdir(REFERENCE_DIR)):
+            if fn.endswith(".reference"):
+                refs[os.path.splitext(fn)[0]] = os.path.join(REFERENCE_DIR, fn)
+    except OSError:
+        pass
+    return refs
+
+def suggest_reference(target_filename, refs):
+    """Auto-pick a reference by matching its name against the target filename."""
+    stem = os.path.splitext(os.path.basename(target_filename or ""))[0].lower()
+    for name in refs:
+        if name.lower() in stem:
+            return name
+    return ""
+
+@app.get("/api/v1/references")
+def get_references(target: str = ""):
+    refs = list_references()
+    return {"references": sorted(refs.keys()), "suggested": suggest_reference(target, refs)}
+
 @app.post("/api/v1/upload")
-async def upload_binary(file: UploadFile = File(...), reference: UploadFile = File(None), requested_analyses: str = Form("")):
+async def upload_binary(file: UploadFile = File(...), reference: UploadFile = File(None),
+                        reference_name: str = Form(""), requested_analyses: str = Form("")):
     file_path = os.path.join(UPLOAD_DIR, file.filename)
     with open(file_path, "wb") as buffer: shutil.copyfileobj(file.file, buffer)
-    # Optional symbolized reference binary: save next to the target under the
-    # sibling name the BIND plugins derive (<binary-stem>.reference), regardless
-    # of the uploaded filename, so ghidriff/bind_se diff against it instead of
-    # the baked default reference.
+    # Symbolized reference binary saved next to the target under the sibling name
+    # the BIND plugins derive (<binary-stem>.reference) so ghidriff/bind_se diff
+    # against it instead of the baked default. Priority:
+    #   1. an explicitly uploaded custom reference, else
+    #   2. a reference_name selected from the server-side library, else
+    #   3. nothing -> the baked default reference applies.
+    ref_path = os.path.join(UPLOAD_DIR, os.path.splitext(file.filename)[0] + ".reference")
     if reference is not None and reference.filename:
-        ref_path = os.path.join(UPLOAD_DIR, os.path.splitext(file.filename)[0] + ".reference")
         with open(ref_path, "wb") as buffer: shutil.copyfileobj(reference.file, buffer)
-        sys_log(f"Upload: reference -> {os.path.basename(ref_path)}")
+        sys_log(f"Upload: custom reference -> {os.path.basename(ref_path)}")
+    elif reference_name:
+        src = list_references().get(reference_name)
+        if src:
+            shutil.copyfile(src, ref_path)
+            sys_log(f"Upload: reference '{reference_name}' -> {os.path.basename(ref_path)}")
+        else:
+            sys_log(f"Upload: reference '{reference_name}' not found in library; using baked default")
     analyses = [a.strip() for a in requested_analyses.split(",") if a.strip()]
     sys_log(f"Upload: {file.filename} for {analyses}")
     r.publish("xbin:events", json.dumps({"type": "NEW_BINARY", "filename": file.filename, "path": f"/app/uploads/{file.filename}", "requested_analyses": analyses}))
@@ -591,8 +632,6 @@ def dashboard():
                 <button class="btn" style="background: #2d3748;" onclick="showWorkerLogs()">Worker Deep Dive</button>
                 <button class="btn btn-danger btn-action" onclick="clearSession()">Clear Session</button>
                 <button class="btn btn-primary btn-action" onclick="bulkAction('start')">Start Fleet</button>
-                <input type="file" id="ref" style="display:none" onchange="document.getElementById('refl').innerText=this.files[0].name">
-                <button class="btn btn-action" style="background:#2d3748" onclick="document.getElementById('ref').click()">📎 <span id="refl">Reference Bin</span></button>
                 <button class="btn btn-danger btn-action" onclick="powerOff()">Power Off</button>
                 <div id="orc-health" class="badge badge-running">Orchestrator: OK</div>
             </div>
@@ -601,8 +640,16 @@ def dashboard():
             <aside class="sidebar">
                 <div class="card">
                     <h2>Deploy Analysis</h2>
-                    <input type="file" id="f" style="display:none" onchange="document.getElementById('fl').innerText=this.files[0].name">
+                    <input type="file" id="f" style="display:none" onchange="document.getElementById('fl').innerText=this.files[0].name; loadReferences(this.files[0].name)">
                     <button class="btn btn-primary" style="width:100%" onclick="document.getElementById('f').click()">📁 <span id="fl">Choose Binary</span></button>
+                    <div style="margin-top:1rem;">
+                        <label style="font-size:0.7rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.05em;">Reference Binary <span style="text-transform:none; color:var(--muted)">(server-selected)</span></label>
+                        <select id="refsel" onchange="onRefSelChange(this)" style="width:100%; margin-top:0.3rem; padding:0.5rem; background:#0b0f1a; color:var(--text); border:1px solid var(--border); border-radius:8px; font-size:0.8rem;">
+                            <option value="">Baked default (arducopter)</option>
+                        </select>
+                        <input type="file" id="ref" style="display:none" onchange="onCustomRef(this)">
+                        <div id="refl" style="font-size:0.62rem; color:var(--muted); margin-top:0.25rem;"></div>
+                    </div>
                     <div style="margin-top:1rem; padding-top:1rem; border-top:1px solid var(--border);">
                         <div style="display:grid; grid-template-columns: 1fr 1fr; gap:0.4rem;">
                             <label style="font-size:0.75rem; display:flex; align-items:center; gap:0.3rem;"><input type="checkbox" class="goal" value="signature_matching" checked> Signature Matching</label>
@@ -659,10 +706,41 @@ def dashboard():
             const CAT_LABELS = { signature_matching: 'Signature Matching', equation_recovery: 'Equation Recovery' };
             function catLabel(c) { return CAT_LABELS[c] || c.replace(/_/g,' '); }
             function toast(m) { const t=document.createElement('div'); t.className='toast'; t.innerText=m; document.getElementById('toasts').appendChild(t); setTimeout(()=>t.remove(),3000); }
+            async function loadReferences(target) {
+                try {
+                    const res = await fetch('/api/v1/references?target=' + encodeURIComponent(target||''));
+                    const d = await res.json();
+                    const sel = document.getElementById('refsel');
+                    let html = '<option value="">Baked default (arducopter)</option>';
+                    (d.references||[]).forEach(n => { html += `<option value="${n}">${n}</option>`; });
+                    html += '<option value="__custom__">Upload custom file…</option>';
+                    sel.innerHTML = html;
+                    sel.value = d.suggested || '';
+                    document.getElementById('ref').value = '';
+                    document.getElementById('refl').innerText = d.suggested ? ('auto-selected: ' + d.suggested) : '';
+                } catch(e) {}
+            }
+            function onRefSelChange(sel) {
+                const label = document.getElementById('refl');
+                if (sel.value === '__custom__') { document.getElementById('ref').click(); }
+                else { document.getElementById('ref').value = ''; label.innerText = sel.value ? ('using: ' + sel.value) : 'using baked default'; }
+            }
+            function onCustomRef(inp) {
+                const label = document.getElementById('refl');
+                if (inp.files[0]) { label.innerText = 'custom: ' + inp.files[0].name; }
+                else { document.getElementById('refsel').value = ''; label.innerText = 'using baked default'; }
+            }
             async function upload() {
-                const fd=new FormData(); fd.append('file', document.getElementById('f').files[0]);
-                const ref=document.getElementById('ref').files[0];
-                if(ref) fd.append('reference', ref);
+                const f = document.getElementById('f').files[0];
+                if (!f) { toast('Choose a binary first'); return; }
+                const fd=new FormData(); fd.append('file', f);
+                const sel = document.getElementById('refsel').value;
+                if (sel === '__custom__') {
+                    const ref=document.getElementById('ref').files[0];
+                    if(ref) fd.append('reference', ref);
+                } else if (sel) {
+                    fd.append('reference_name', sel);
+                }
                 const goals=Array.from(document.querySelectorAll('.goal:checked')).map(i=>i.value);
                 fd.append('requested_analyses', goals.join(','));
                 await fetch('/api/v1/upload', {method:'POST', body:fd}); toast('Binary Announced');
@@ -913,7 +991,7 @@ def dashboard():
                     }
                 }
             }
-            setInterval(refresh, 2000); refresh();
+            setInterval(refresh, 2000); refresh(); loadReferences('');
         </script>
     </body>
     </html>
