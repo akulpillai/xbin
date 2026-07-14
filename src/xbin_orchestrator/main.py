@@ -86,7 +86,7 @@ def sys_log(msg):
     entry = f"[{timestamp}] {msg}"
     print(entry)
     r.lpush("xbin:syslogs", entry)
-    r.ltrim("xbin:syslogs", 0, 100)
+    r.ltrim("xbin:syslogs", 0, 4999)  # keep enough for a full ~100-function verbose run
 
 def set_plugin_state(name, category, status, error=None):
     state = {"status": status, "last_update": time.time()}
@@ -190,9 +190,43 @@ async def upload_binary(file: UploadFile = File(...), reference: UploadFile = Fi
 def get_plugin_logs(name: str, category: str):
     container_name = get_container_name(name, category)
     try:
-        res = subprocess.run(["docker", "logs", "--tail", "100", container_name], capture_output=True, text=True)
+        res = subprocess.run(["docker", "logs", "--tail", "100", container_name], capture_output=True, text=True, timeout=5)
         return {"logs": res.stdout + res.stderr}
     except Exception as e: return {"logs": f"Error: {e}"}
+
+@app.get("/api/v1/workers/logs")
+def get_merged_worker_logs(tail: int = 80):
+    """Merged stdout of every running worker container, one interleaved stream.
+
+    Tails each `xbin-worker-*` container with docker's RFC3339 --timestamps and
+    sorts lexically (== chronologically), tagging each line with the short worker
+    name. This is the "Worker Deep Dive" live view: the richest per-function
+    progress (workers print `Result posted for <addr>` etc. to stdout). Every
+    subprocess is timeout-guarded and per-container isolated so one wedged
+    container/daemon can't blank the whole response.
+    """
+    tail = max(1, min(tail, 200))
+    try:
+        ps = subprocess.run(
+            ["docker", "ps", "--filter", "name=xbin-worker-", "--filter", "status=running", "--format", "{{.Names}}"],
+            capture_output=True, text=True, timeout=5)
+        names = [n for n in ps.stdout.splitlines() if n]
+    except Exception as e:
+        return {"logs": f"Error listing workers: {e}", "workers": [], "count": 0}
+    merged = []
+    for cname in names:
+        short = cname.replace("xbin-worker-", "")
+        try:
+            res = subprocess.run(["docker", "logs", "--tail", str(tail), "--timestamps", cname],
+                                 capture_output=True, text=True, timeout=5)
+            for line in (res.stdout + res.stderr).splitlines():
+                ts, _, rest = line.partition(" ")  # RFC3339 prefix sorts chronologically
+                merged.append((ts, f"[{short}] {rest}"))
+        except Exception as e:
+            merged.append(("", f"[{short}] <log error: {e}>"))
+    merged.sort(key=lambda x: x[0])
+    return {"logs": "\n".join(m[1] for m in merged) or "No worker output yet.",
+            "workers": names, "count": len(merged)}
 
 @app.get("/api/v1/plugins/available")
 def list_available_plugins():
@@ -554,6 +588,7 @@ def dashboard():
             </div>
             <div style="display: flex; gap: 1rem; align-items: center;">
                 <button class="btn" style="background: #2d3748;" onclick="showSystemLogs()">System Logs</button>
+                <button class="btn" style="background: #2d3748;" onclick="showWorkerLogs()">Worker Deep Dive</button>
                 <button class="btn btn-danger btn-action" onclick="clearSession()">Clear Session</button>
                 <button class="btn btn-primary btn-action" onclick="bulkAction('start')">Start Fleet</button>
                 <input type="file" id="ref" style="display:none" onchange="document.getElementById('refl').innerText=this.files[0].name">
@@ -597,6 +632,30 @@ def dashboard():
         <div class="toast-container" id="toasts"></div>
         <script>
             let lastHeartbeats = {};
+            // ---- Live log tail (shared by System Logs + Worker Deep Dive) ----
+            let logTimer = null;
+            function stopLiveTail() {
+                if (logTimer) { clearInterval(logTimer); logTimer = null; }
+                const lg = document.getElementById('modal-legend'); if (lg) lg.innerHTML = '';
+            }
+            // fetchFn: async () => log-text string ; ms: poll cadence
+            function startLiveTail(fetchFn, ms) {
+                stopLiveTail();
+                const el = document.getElementById('modal-content');
+                document.getElementById('modal-legend').innerHTML =
+                    '<span style="color:var(--success); animation:blink 1.5s infinite;">● LIVE</span>';
+                let first = true;
+                const tick = async () => {
+                    if (document.getElementById('modal').style.display === 'none') { stopLiveTail(); return; }
+                    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+                    try { el.innerText = (await fetchFn()) || 'No output yet.'; }   // innerText: no XSS from log bytes
+                    catch (e) { el.innerText = 'Error loading logs: ' + e.message; }
+                    if (first || nearBottom) el.scrollTop = el.scrollHeight;        // auto-scroll unless user scrolled up
+                    first = false;
+                };
+                tick();
+                logTimer = setInterval(tick, ms);
+            }
             const CAT_LABELS = { signature_matching: 'Signature Matching', equation_recovery: 'Equation Recovery' };
             function catLabel(c) { return CAT_LABELS[c] || c.replace(/_/g,' '); }
             function toast(m) { const t=document.createElement('div'); t.className='toast'; t.innerText=m; document.getElementById('toasts').appendChild(t); setTimeout(()=>t.remove(),3000); }
@@ -632,6 +691,7 @@ def dashboard():
                 });
             }
             async function showLogs(n, c="") {
+                stopLiveTail();
                 document.getElementById('modal-title').innerText=`Logs: ${n}`;
                 document.getElementById('cy-container').style.display='none'; document.getElementById('mem-map-container').style.display='none';
                 document.getElementById('modal-content').style.display='block'; document.getElementById('overlay').style.display='block'; document.getElementById('modal').style.display='flex';
@@ -641,11 +701,29 @@ def dashboard():
             function showSystemLogs() {
                 document.getElementById('modal-title').innerText='System Logs';
                 document.getElementById('cy-container').style.display='none'; document.getElementById('mem-map-container').style.display='none';
-                document.getElementById('modal-legend').innerHTML = ''; document.getElementById('modal-content').style.display='block';
+                document.getElementById('modal-content').style.display='block';
                 document.getElementById('overlay').style.display='block'; document.getElementById('modal').style.display='flex';
-                fetch('/api/v1/system/logs').then(r=>r.json()).then(d=>document.getElementById('modal-content').innerText=d.logs);
+                document.getElementById('modal-content').innerText = 'Loading...';
+                startLiveTail(async () => {
+                    const res = await fetch('/api/v1/system/logs');
+                    const d = await res.json();
+                    return d.logs;
+                }, 2000);
+            }
+            function showWorkerLogs() {
+                document.getElementById('modal-title').innerText='Worker Deep Dive (all containers)';
+                document.getElementById('cy-container').style.display='none'; document.getElementById('mem-map-container').style.display='none';
+                document.getElementById('modal-content').style.display='block';
+                document.getElementById('overlay').style.display='block'; document.getElementById('modal').style.display='flex';
+                document.getElementById('modal-content').innerText = 'Loading...';
+                startLiveTail(async () => {
+                    const res = await fetch('/api/v1/workers/logs?tail=80');
+                    const d = await res.json();
+                    return d.logs;
+                }, 3000);
             }
             function showBlackboardLogs(cat) {
+                stopLiveTail();
                 document.getElementById('modal-title').innerText=`Audit Trail: ${cat}`;
                 document.getElementById('cy-container').style.display='none'; document.getElementById('mem-map-container').style.display='none';
                 document.getElementById('modal-legend').innerHTML = ''; document.getElementById('modal-content').style.display='block';
@@ -653,6 +731,7 @@ def dashboard():
                 fetch(`/api/v1/blackboard/${cat}/audit`).then(r=>r.json()).then(d=>document.getElementById('modal-content').innerText=d.logs || 'No entries.');
             }
             async function showExplanation(cat, item) {
+                stopLiveTail();
                 document.getElementById('modal-title').innerText = `${catLabel(cat)}: ${item}`;
                 document.getElementById('cy-container').style.display='none';
                 document.getElementById('mem-map-container').style.display='none';
@@ -761,7 +840,7 @@ def dashboard():
                 catch(e) { toast('Copy failed — select manually'); }
                 document.body.removeChild(ta);
             }
-            function closeModal() { document.getElementById('modal').style.display='none'; document.getElementById('overlay').style.display='none'; }
+            function closeModal() { stopLiveTail(); document.getElementById('modal').style.display='none'; document.getElementById('overlay').style.display='none'; }
             let collapsedCategories = {};
             function toggleCategory(cat) {
                 collapsedCategories[cat] = !collapsedCategories[cat];
@@ -900,8 +979,8 @@ class XbinOrchestratorServicer(orchestrator_pb2_grpc.OrchestratorServiceServicer
                     target_hyp["validators"].append(request.backend_name)
                     target_hyp["score"] = round(target_hyp["score"] + (request.confidence * weight), 3)
                     log_entry = f"[{timestamp}] {request.backend_name} VOUCHED for {request.item_key} (ID: {target_hyp.get('id')})"
-                    r.lpush(audit_key, log_entry); r.ltrim(audit_key, 0, 100)
-                    sys_log(f"Validation: {request.backend_name} -> {request.item_key}")
+                    r.lpush(audit_key, log_entry); r.ltrim(audit_key, 0, 4999)
+                    sys_log(f"Validation: {request.backend_name} -> {cat}/{request.item_key} (score {target_hyp['score']})")
                 new_hyp = target_hyp # For the event broadcast
             else:
                 return orchestrator_pb2.PostResultResponse(accepted=False, current_status="TARGET_NOT_FOUND")
@@ -929,7 +1008,13 @@ class XbinOrchestratorServicer(orchestrator_pb2_grpc.OrchestratorServiceServicer
                 }
                 state["hypotheses"].append(new_hyp)
                 log_entry = f"[{timestamp}] {request.backend_name} -> {request.item_key} (New Hypothesis)"
-                r.lpush(audit_key, log_entry); r.ltrim(audit_key, 0, 100)
+                r.lpush(audit_key, log_entry); r.ltrim(audit_key, 0, 4999)
+                # Verbose per-function progress into the System Logs stream so the
+                # live viewer shows results landing one function at a time.
+                _d = data if isinstance(data, dict) else {}
+                _summary = (_d.get("known_function") or _d.get("recovered_expression")
+                            or (_d.get("explanation", "")[:60]) or "result")
+                sys_log(f"Result: {request.backend_name} -> {cat}/{request.item_key} = {_summary} (conf {round(request.confidence, 3)})")
 
         # Re-sort and determine status
         state["hypotheses"] = sorted(state["hypotheses"], key=lambda x: x["score"], reverse=True)
