@@ -665,7 +665,7 @@ def dashboard():
                         if (data.output_dir) lines.push(`Output: ${data.output_dir}`);
                         lines.push('');
                     });
-                    content.innerText = lines.join('\n');
+                    content.innerText = lines.join('\\n');
                 } catch (e) { content.innerText = `Error: ${e.message}`; }
             }
             async function showConsensus(cat, item) {
