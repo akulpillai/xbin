@@ -147,6 +147,18 @@ practical `equation_recovery` producer. (With #5/#6 fixed, bind_se now reaches
 and works through its per-function loop far more readily — it posted steadily on
 the Betaflight target — but this note stands for large firmware.)
 
+### D. pysindy needs sibling I/O pairs (v1) — NOTE
+The `pysindy` plugin (`equation_recovery`, from `submodules/pysyndy`) recovers a
+function's equation *structure* statically with Binary Ninja, but `recover_equation`
+only emits a fitted equation when given numeric I/O pairs `(X, y)`. In v1 those come
+**only** from a sibling `<stem>.iopairs.txt` (`load_iopairs`); if none is present the
+worker logs and skips (no per-function Binary Ninja load). So on a target without an
+`.iopairs.txt` (e.g. Betaflight) `pysindy` posts nothing — the same effective limit
+as `symbolic_regression`, whose QEMU/FastDyn boot-stall detection also fails on
+Betaflight. Best-effort dynamic I/O-pair collection (QEMU/FastDyn) is the planned
+follow-up that would let `pysindy`/`symbolic_regression` produce equations without a
+pre-supplied iopairs file.
+
 ---
 
 ## Notes for future rebuilds

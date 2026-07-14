@@ -138,7 +138,7 @@ def _handle_guarded(ctx, client, func):
 @xbin.plugin(
     name="bind_se",
     category="equation_recovery",
-    display_name="BIND-SE (symbolic execution)",
+    display_name="Symbolic Execution (bind-se)",
     description="angr symbolic execution recovers each function's SMT2 signature; matches known signatures, else the local LLM explains the recovered expression.",
 )
 class BindSePlugin:

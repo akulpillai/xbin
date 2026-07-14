@@ -2,3 +2,7 @@
 	path = submodules/Morpheus
 	url = git@github.com:purseclab/Morpheus.git
 	branch = integration
+[submodule "submodules/pysyndy"]
+	path = submodules/pysyndy
+	url = git@github.com:PSecLab/pysyndy.git
+	branch = main

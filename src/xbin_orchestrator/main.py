@@ -85,8 +85,9 @@ WORKER_ENV_PASSTHROUGH = tuple(
 BACKEND_WEIGHTS = {
     "fid": 1.0,                  # Ghidra FunctionID signature matching
     "ghidriff": 0.95,           # Ghidra ghidriff / BSim binary diffing
+    "symbolic_regression": 0.90, # PySR symbolic regression + ollama explanation (highest-priority recoverer)
     "bind_se": 0.85,            # angr symbolic execution + ollama explanation
-    "symbolic_regression": 0.85, # PySR symbolic regression + ollama explanation
+    "pysindy": 0.85,            # BIND binary->equation (Binja structure + numpy STLSQ sparse regression)
     "bind_arbiter": 1.0,        # ollama arbiter (ranker)
 }
 MARGIN_THRESHOLD = 0.05
