@@ -501,7 +501,8 @@ def dashboard():
     <html>
     <head>
         <title>xbin | Visual Analysis Dashboard</title>
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.26.0/cytoscape.min.js"></script>
+        <!-- No external assets: the page must load fully self-contained over plain
+             HTTP from a remote browser (the old Cytoscape CDN was unused/dead). -->
         <style>
             :root { --bg: #0b0f1a; --card: #161e2e; --text: #f3f4f6; --accent: #3b82f6; --danger: #ef4444; --success: #10b981; --warning: #f59e0b; --muted: #6b7280; --border: #2d3748; }
             body { font-family: 'Inter', sans-serif; background: var(--bg); color: var(--text); margin: 0; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
@@ -744,7 +745,22 @@ def dashboard():
                 });
             }
             function hex(n) { return '0x' + n.toString(16); }
-            function copyLogs() { navigator.clipboard.writeText(document.getElementById('modal-content').innerText); toast('Copied!'); }
+            function copyLogs() {
+                const text = document.getElementById('modal-content').innerText;
+                // navigator.clipboard is undefined on non-secure origins (plain HTTP
+                // via direct IP), so fall back to a hidden textarea + execCommand.
+                if (navigator.clipboard && window.isSecureContext) {
+                    navigator.clipboard.writeText(text).then(()=>toast('Copied!'), ()=>fallbackCopy(text));
+                } else { fallbackCopy(text); }
+            }
+            function fallbackCopy(text) {
+                const ta = document.createElement('textarea');
+                ta.value = text; ta.style.position='fixed'; ta.style.opacity='0';
+                document.body.appendChild(ta); ta.focus(); ta.select();
+                try { toast(document.execCommand('copy') ? 'Copied!' : 'Copy failed — select manually'); }
+                catch(e) { toast('Copy failed — select manually'); }
+                document.body.removeChild(ta);
+            }
             function closeModal() { document.getElementById('modal').style.display='none'; document.getElementById('overlay').style.display='none'; }
             let collapsedCategories = {};
             function toggleCategory(cat) {
