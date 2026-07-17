@@ -120,14 +120,33 @@ def elf_to_firmware(binary_path):
                 off = s["p_paddr"] - base
                 img[off:off + len(data)] = data
             setup_end = None
+            func_addrs = set()
             symtab = elf.get_section_by_name(".symtab")
             if symtab is not None:
                 for sym in symtab.iter_symbols():
-                    if sym.name == "main":
+                    if sym.name == "main" and setup_end is None:
                         setup_end = int(sym["st_value"]) & ~1  # drop the Thumb bit
-                        break
+                    if sym["st_info"]["type"] == "STT_FUNC":
+                        a = int(sym["st_value"]) & ~1
+                        if base <= a < end:
+                            func_addrs.add(a)
         with open(raw_path, "wb") as f:
             f.write(img)
+        # Authoritative function list from the ELF's symbol table. The raw-blob
+        # BN∩Ghidra intersection drops symbol-less leaf functions (on sample.axf it
+        # returned the 4 reset-reachable functions and missed every FP leaf), so
+        # function_universe() prefers this list when present.
+        if func_addrs:
+            with open(raw_path + ".funcs", "w") as f:
+                f.write("\n".join(f"0x{a:08x}" for a in sorted(func_addrs)) + "\n")
+        # Cache the setup-end (main) as the sidecar Morpheus's find_setup_end reads.
+        # symbolic_regression's get_setup_end() only honors this sidecar or a live
+        # QEMU boot-trace (it ignores firmware_setup_end_addr in the config), and the
+        # boot-trace's "confident boot stall" heuristic fails on many images -- so
+        # seeding it from the ELF's `main` lets SR skip the boot-trace entirely.
+        if setup_end is not None:
+            with open(raw_path + ".setup_end", "w") as f:
+                f.write(f"{setup_end:#x}\n")
         return raw_path, base, setup_end
     except Exception as e:  # never let conversion break the run -- fall back to raw
         print(f"[bind_helpers] ELF->raw firmware conversion failed for "
@@ -188,7 +207,22 @@ def function_universe(config_path):
     This is the same universe the Morpheus job server hands out; every tool posts
     hypotheses keyed by these addresses so their results line up on the board.
     """
-    from bind_integration import get_func_intersection
     from bind_jobs.util import norm_addr
 
+    # Prefer the ELF-derived authoritative function list (written by
+    # elf_to_firmware next to the raw image) when the upload was an ELF: the
+    # raw-blob BN∩Ghidra intersection misses symbol-less leaf functions, so
+    # SR/bind_se would otherwise see none of the FP leaves pysindy recovers.
+    try:
+        from bind_jobs.util import load_bind_config
+        cfg = load_bind_config(config_path)
+        fw = cfg.get("firmware_bin_path") if hasattr(cfg, "get") else None
+        if fw and os.path.exists(fw + ".funcs"):
+            addrs = [ln.strip() for ln in open(fw + ".funcs") if ln.strip()]
+            if addrs:
+                return addrs
+    except Exception as e:
+        print(f"[bind_helpers] .funcs universe unavailable ({e!r}); using BN∩Ghidra")
+
+    from bind_integration import get_func_intersection
     return [norm_addr(a) for a in get_func_intersection(config_path)]
