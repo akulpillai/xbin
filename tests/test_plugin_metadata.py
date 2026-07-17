@@ -15,7 +15,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 PLUGINS = os.path.join(_REPO_ROOT, "plugins")
 
 # Backend names that carry a weight in main.py BACKEND_WEIGHTS (unknown -> 0.5).
-WEIGHTED_BACKENDS = {"fid", "ghidriff", "bind_se", "symbolic_regression", "bind_arbiter"}
+WEIGHTED_BACKENDS = {"fid", "ghidriff", "bind_se", "symbolic_regression", "pysindy", "bind_arbiter"}
 
 # path -> (name, category, is_ranker, is_validator)
 EXPECTED = {
@@ -24,6 +24,7 @@ EXPECTED = {
     "signature_matching/bind_arbiter/arbiter_worker.py": ("bind_arbiter", "signature_matching", True, False),
     "equation_recovery/bind_se/bind_se_worker.py": ("bind_se", "equation_recovery", False, False),
     "equation_recovery/symbolic_regression/sr_worker.py": ("symbolic_regression", "equation_recovery", False, False),
+    "equation_recovery/pysindy/pysindy_worker.py": ("pysindy", "equation_recovery", False, False),
 }
 
 
