@@ -63,3 +63,6 @@ orchestrator_*.log
 # Server-side reference-binary library (large ELFs stay local)
 references/*
 !references/.gitkeep
+
+# Local test firmware (pysyndy sample); keep out of the public fork
+/sample.axf

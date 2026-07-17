@@ -1,98 +1,108 @@
-"""pysindy (BIND binary->equation) xbin plugin.
+"""pysindy (BIND binary->equation) xbin plugin -- automated recovery pipeline.
 
-Wraps pysyndy's ``recover_equation`` (baked at ``$PYSINDY_ROOT/binja_scripts`` in
-the ``pysindy:latest`` base). It competes on the ``equation_recovery`` blackboard
-with ``bind_se`` (angr symbolic execution) and ``symbolic_regression`` (PySR):
-pysindy lifts each function with Binary Ninja to recover the equation *structure*,
-then fits a closed-form equation via SINDy-style sparse regression (STLSQ).
+Drives pysyndy's end-to-end pipeline through its sanctioned two-verb API
+(``submodules/pysyndy/xbin_api.py``, baked into ``pysindy:latest``):
 
-v1 iopairs policy (sibling only): the fit needs numeric I/O pairs (X, y). We read
-them from a sibling ``<stem>.iopairs.txt`` (``load_iopairs``). If none is present
-(``recover_equation`` would return ``equation=None`` -- structure only), we log
-and skip *without* loading every function through Binary Ninja. Best-effort
-dynamic (QEMU/FastDyn) iopair collection is a documented follow-up.
+  * ``is_candidate(func)``            -- single-basic-block FP-leaf functions.
+  * ``recover_for_function(bin, addr)`` -- collect this function's I/O pairs by
+    running the firmware under QEMU/FastDyn, then fit a closed-form equation.
+
+So there is **no pre-supplied ``.iopairs.txt``** anymore: the worker discovers the
+recoverable functions itself (in Binary Ninja's own address space, so the address
+feeds straight into recovery -- no angr<->BN translation) and the API collects the
+I/O dynamically. It competes on the ``equation_recovery`` blackboard with
+``bind_se`` (angr symbolic execution) and ``symbolic_regression`` (PySR).
+
+Requires a non-stripped Cortex-M firmware ELF with a ``main`` symbol and a vector
+table -- xbin_api derives the bndb / VTOR / setup_end from it. On a stripped or
+raw target (e.g. a bare ``.bin``) it logs and skips gracefully.
 """
 import os
 import sys
 
 import xbin
-from xbin.bind_helpers import CAT_EQUATION, prepare_config, function_universe, sibling
+from xbin.bind_helpers import CAT_EQUATION
 
-# pysyndy's recovery core, baked into pysindy:latest by scripts/build_pysindy_base.sh.
-_PYSINDY_CORE = os.path.join(
-    os.environ.get("PYSINDY_ROOT", "/home/bind/pysyndy"), "binja_scripts")
+# pysyndy tree baked into pysindy:latest by scripts/build_pysindy_base.sh; holds
+# xbin_api.py at the root and the recovery core under binja_scripts/.
+_PYSINDY_ROOT = os.environ.get("PYSINDY_ROOT", "/home/bind/pysyndy")
 
 
 @xbin.plugin(
     name="pysindy",
     category="equation_recovery",
     display_name="Sparse Regression (pysindy)",
-    description="Lifts each function with Binary Ninja and recovers a closed-form equation via SINDy-style sparse regression; fits/verifies against sibling I/O pairs when provided.",
+    description="Runs the firmware under QEMU/FastDyn to collect per-function I/O, then recovers a closed-form equation via SINDy-style sparse regression (pysyndy's automated pipeline).",
 )
 class PysindyPlugin:
     def on_new_binary(self, binary_path, requested_goals):
         if CAT_EQUATION not in (requested_goals or []):
             print(f"[pysindy] {CAT_EQUATION} not requested; skipping")
             return
-
-        # Fit needs numeric I/O pairs; without a sibling file the recovery is
-        # structure-only (equation=None), so skip fast rather than lifting every
-        # function through Binary Ninja for nothing.
-        io_path = sibling(binary_path, ".iopairs.txt")
-        if not io_path:
-            print("[pysindy] no <stem>.iopairs.txt sibling; skipping recovery "
-                  "(dynamic I/O-pair collection is a follow-up)")
+        if not os.path.exists(binary_path):
+            print(f"[pysindy] binary not found: {binary_path}; skipping")
             return
 
-        # Heavy imports deferred: only importable inside pysindy:latest.
-        if _PYSINDY_CORE not in sys.path:
-            sys.path.insert(0, _PYSINDY_CORE)
-        import equation_recovery as PIPE   # recover_equation + load_iopairs
-
+        # Deferred heavy imports: only importable inside pysindy:latest.
+        if _PYSINDY_ROOT not in sys.path:
+            sys.path.insert(0, _PYSINDY_ROOT)
         try:
-            _names, X, y = PIPE.load_iopairs(io_path)
+            import binaryninja as bn
+            import xbin_api
         except Exception as e:
-            print(f"[pysindy] iopairs load failed ({io_path}): {e!r}; skipping")
+            print(f"[pysindy] pipeline unavailable ({e!r}); skipping")
             return
-        print(f"[pysindy] loaded I/O pairs from {os.path.basename(io_path)}")
 
-        config, config_path = prepare_config(binary_path)
-        funcs = function_universe(config_path)   # BN∩Ghidra addrs (normalized hex)
-        print(f"[pysindy] {len(funcs)} functions in the BN∩Ghidra universe")
+        # Discover candidates (single-bb FP leaves) in Binary Ninja's own address
+        # space -- the addresses recover_for_function expects.
+        try:
+            bv = bn.load(binary_path)
+            bv.update_analysis_and_wait()
+            cands = [f.start for f in bv.functions if xbin_api.is_candidate(f)]
+            bv.file.close()
+        except Exception as e:
+            print(f"[pysindy] Binary Ninja discovery failed ({e!r}); skipping "
+                  "(need a non-stripped Cortex-M firmware ELF)")
+            return
+        print(f"[pysindy] {len(cands)} candidate FP function(s): {[hex(a) for a in cands]}")
 
         posted = 0
-        for func in funcs:
+        for addr in cands:
             try:
-                res = PIPE.recover_equation(binary_path, func=int(func, 16), X=X, y=y)
+                res = xbin_api.recover_for_function(binary_path, addr)
             except Exception as e:
-                print(f"[pysindy] recovery failed for {func}: {e!r}")
+                print(f"[pysindy] recovery errored for {hex(addr)}: {e!r}")
                 continue
-            eq = res.get("equation")
-            if not eq or str(eq).startswith("<fit-error"):
+            if not res or not res.get("equation") or str(res["equation"]).startswith("<fit-error"):
+                print(f"[pysindy] no equation for {hex(addr)} (no usable I/O pairs)")
                 continue
+            eq = res["equation"]
             r2 = res.get("r2")
-            confidence = (1.0 if res.get("verified")
+            verified = res.get("verified")
+            confidence = (1.0 if verified
                           else (float(r2) if isinstance(r2, (int, float)) and 0.0 <= r2 <= 1.0
                                 else 0.5))
             xbin.post_result(
-                item_key=func,
+                item_key=f"0x{addr:08x}",
                 data={
                     "recovered_expression": eq,
                     "explanation": (f"pysindy recovered: {eq} "
-                                    f"(R2={r2}, rmse={res.get('rmse')}, verified={res.get('verified')})"),
+                                    f"(R2={r2}, rmse={res.get('rmse')}, verified={verified})"),
                     "function": res.get("function"),
                     "function_start": res.get("function_start"),
                     "r2": r2,
                     "rmse": res.get("rmse"),
                     "median_rel_err": res.get("median_rel_err"),
-                    "verified": res.get("verified"),
+                    "verified": verified,
+                    "iopairs": res.get("iopairs"),
                     "match_source": "pysindy_sindy",
                 },
                 confidence=confidence,
                 category=CAT_EQUATION,
             )
             posted += 1
-        print(f"[pysindy] posted {posted} recovered equations")
+            print(f"[pysindy] posted 0x{addr:08x}: {eq} (conf {round(confidence, 3)})")
+        print(f"[pysindy] done; posted {posted}/{len(cands)} equations")
 
 
 if __name__ == "__main__":

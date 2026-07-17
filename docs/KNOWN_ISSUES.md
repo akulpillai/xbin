@@ -147,17 +147,29 @@ practical `equation_recovery` producer. (With #5/#6 fixed, bind_se now reaches
 and works through its per-function loop far more readily — it posted steadily on
 the Betaflight target — but this note stands for large firmware.)
 
-### D. pysindy needs sibling I/O pairs (v1) — NOTE
-The `pysindy` plugin (`equation_recovery`, from `submodules/pysyndy`) recovers a
-function's equation *structure* statically with Binary Ninja, but `recover_equation`
-only emits a fitted equation when given numeric I/O pairs `(X, y)`. In v1 those come
-**only** from a sibling `<stem>.iopairs.txt` (`load_iopairs`); if none is present the
-worker logs and skips (no per-function Binary Ninja load). So on a target without an
-`.iopairs.txt` (e.g. Betaflight) `pysindy` posts nothing — the same effective limit
-as `symbolic_regression`, whose QEMU/FastDyn boot-stall detection also fails on
-Betaflight. Best-effort dynamic I/O-pair collection (QEMU/FastDyn) is the planned
-follow-up that would let `pysindy`/`symbolic_regression` produce equations without a
-pre-supplied iopairs file.
+### D. pysindy is automated now; needs a non-stripped firmware ELF — NOTE
+The `pysindy` plugin (`equation_recovery`, from `submodules/pysyndy`) drives
+pysyndy's **automated** pipeline via `xbin_api` (`is_candidate` + `recover_for_function`):
+it discovers single-basic-block FP-leaf functions and, per function, **collects I/O
+pairs by running the firmware under QEMU/FastDyn**, then fits — no pre-supplied
+`.iopairs.txt`. (Superseded the earlier sibling-iopairs v1.) Verified on `sample.axf`
+(4/5 candidates recovered, all `verified=True`, R²≈1.0, e.g. `+35*sqrt(x) +5*x*sqrt(x)`).
+
+Requirements/limits:
+- Needs a **non-stripped Cortex-M firmware ELF** with a `main` symbol + a vector-table
+  section — `xbin_api` derives the bndb/VTOR/setup_end from it. On a raw `.bin` or a
+  stripped target the BN discovery fails and the worker skips gracefully.
+- QEMU/FastDyn is reused from bind:latest's Morpheus fork via symlinks baked by
+  `build_pysindy_base.sh` (pysyndy's own `qemu/` source is untracked). If a future
+  pysyndy change diverges the QEMU ABI, build pysyndy's own base instead.
+- The dynamic run needs a 512M `/dev/shm`; the orchestrator now starts workers with
+  `--shm-size=1g`.
+- **The Morpheus tools (fid/ghidriff/bind_se) do NOT accept an ELF like `sample.axf`** —
+  their `find_vtor` reads the file's first word expecting a raw Cortex-M vector table and
+  aborts on the ELF magic (`0x464c457f`). They need a raw firmware `.bin` (e.g. betaflight)
+  or an explicit `firmware_vtor_table_addr`. So on `sample.axf` only `pysindy` (BN-based)
+  produces results; on a raw `.bin`, the Morpheus tools work but `pysindy` skips. Making the
+  Morpheus tools accept ELF input (VTOR override in `prepare_config`) is a possible follow-up.
 
 ---
 

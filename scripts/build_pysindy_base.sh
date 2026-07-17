@@ -49,10 +49,20 @@ FROM ${BASE}
 USER root
 COPY --chown=bind:bind pysyndy /home/bind/pysyndy
 ENV PYSINDY_ROOT=/home/bind/pysyndy \\
-    PYTHONPATH=/home/bind/Morpheus:/home/bind/pysyndy/binja_scripts
+    PYTHONPATH=/home/bind/Morpheus:/home/bind/pysyndy:/home/bind/pysyndy/binja_scripts
 # pysyndy's core needs only numpy/BN (both in bind:latest); add a tomli fallback
 # for its config parsing on Python < 3.11.
 RUN python3 -m pip install --no-cache-dir tomli || true
+# pysyndy's automated collection (xbin_api._cfg_for) hard-codes its QEMU/FastDyn
+# at <pysyndy>/qemu/build. pysyndy's qemu source is untracked, but bind:latest
+# already ships the same BIND QEMU fork + FastDyn plugin (from Morpheus) -- point
+# pysyndy's expected paths at those so the dynamic run works without a rebuild.
+RUN mkdir -p /home/bind/pysyndy/qemu/build/tests/tcg/plugins && \\
+    ln -sf /home/bind/Morpheus/qemu/build/qemu-system-arm \\
+           /home/bind/pysyndy/qemu/build/qemu-system-arm && \\
+    ln -sf /home/bind/Morpheus/qemu/build/tests/tcg/plugins/libvirtual.so \\
+           /home/bind/pysyndy/qemu/build/tests/tcg/plugins/libvirtual.so && \\
+    chown -R bind:bind /home/bind/pysyndy/qemu
 USER bind
 WORKDIR /home/bind/Morpheus
 EOF
