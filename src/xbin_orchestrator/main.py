@@ -53,6 +53,19 @@ UPLOAD_DIR = "uploads"
 # to extend the menu.
 REFERENCE_DIR = "references"
 
+# Persistent per-analysis cache on the big disk, mounted into every worker so the
+# expensive artifacts survive a fleet restart (and are reused on a re-run of the
+# same binary -- e.g. a demo). Two sinks the Morpheus tools reuse across runs:
+#   job_outputs/  -> ghidriff's whole-program diff cache (skips re-diffing the
+#                    multi-MB reference when its <ref>-<target>_diff.json exists)
+#                    + fid's Ghidra project + symbolic_regression outputs.
+#   se_sigdb/     -> bind_se's growing signature DB (skips angr + LLM for
+#                    already-recovered signatures).
+# Both baked dirs are empty in bind:latest, so mounting over them hides nothing.
+# (bind_se's angr rtdb and pysindy's outputs already land under uploads/, which is
+# likewise persisted.) Keeping the fleet warm between runs reuses these too.
+CACHE_DIR = "cache"
+
 # Scratch/temp on the big disk, NOT root. This server's /tmp lives on the small
 # root filesystem (~50G free); the repo (and Docker's data-root) live on the
 # multi-TB /evaldisk. Point every host-side tempfile (the plugin build staging in
@@ -149,11 +162,18 @@ app = FastAPI(title="xbin Multi-Analysis Orchestrator", version="1.8.0")
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(REFERENCE_DIR, exist_ok=True)
+# Persistent worker caches (job_outputs = ghidriff diff / fid ghidra proj / SR out;
+# se_sigdb = bind_se signature DB). Created here + world-writable for the same
+# reason as uploads/ (workers run as uid bind=1000).
+CACHE_JOB_OUTPUTS = os.path.join(CACHE_DIR, "job_outputs")
+CACHE_SE_SIGDB = os.path.join(CACHE_DIR, "se_sigdb")
 # uploads/ is bind-mounted into every worker container, but the workers run as a
 # different uid (bind=1000) and cache sidecars (<bin>.setup_end, <bin>.bndb) next
 # to the firmware. Make it world-writable so bind_se/symbolic_regression can run.
-try: os.chmod(UPLOAD_DIR, 0o777)
-except OSError: pass
+for _d in (UPLOAD_DIR, CACHE_JOB_OUTPUTS, CACHE_SE_SIGDB):
+    os.makedirs(_d, exist_ok=True)
+    try: os.chmod(_d, 0o777)
+    except OSError: pass
 
 def get_container_name(name: str, category: str):
     return f"xbin-worker-{category.strip()}-{name.strip()}"
@@ -492,10 +512,19 @@ def bg_start_plugin(name: str, category: str):
         set_plugin_state(name, category, "STARTING")
         subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
         abs_uploads = os.path.abspath(UPLOAD_DIR)
+        abs_job_outputs = os.path.abspath(CACHE_JOB_OUTPUTS)
+        abs_se_sigdb = os.path.abspath(CACHE_SE_SIGDB)
         # --shm-size: the pysindy/symbolic_regression dynamic runs boot Cortex-M
         # firmware under QEMU system mode with a 512M /dev/shm memory-backend-file;
         # the 64M container default is too small, so give every worker room.
-        run_cmd = ["docker", "run", "-d", "--name", container_name, "--network", "host", "--shm-size=1g", "-v", f"{abs_uploads}:/app/uploads", "-e", "XBIN_ORCHESTRATOR=localhost:50051", "-e", "REDIS_HOST=localhost", "-e", "PYTHONUNBUFFERED=1"]
+        run_cmd = ["docker", "run", "-d", "--name", container_name, "--network", "host", "--shm-size=1g",
+                   "-v", f"{abs_uploads}:/app/uploads",
+                   # Persist the reusable analysis caches across restarts so a
+                   # re-run of the same binary skips ghidriff's reference diff and
+                   # bind_se's already-recovered signatures.
+                   "-v", f"{abs_job_outputs}:/home/bind/Morpheus/job_outputs",
+                   "-v", f"{abs_se_sigdb}:/home/bind/Morpheus/signature_matching/signatures/se",
+                   "-e", "XBIN_ORCHESTRATOR=localhost:50051", "-e", "REDIS_HOST=localhost", "-e", "PYTHONUNBUFFERED=1"]
         # Forward opt-in worker tunables (e.g. the bind_se fork-guard caps) when set.
         for _var in WORKER_ENV_PASSTHROUGH:
             _val = os.environ.get(_var)

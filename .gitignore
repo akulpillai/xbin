@@ -66,3 +66,6 @@ references/*
 
 # Local test firmware (pysyndy sample); keep out of the public fork
 /sample.axf
+
+# Persistent worker analysis caches (ghidriff diff / fid ghidra proj / bind_se sigdb)
+cache/
