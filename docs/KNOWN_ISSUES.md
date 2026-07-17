@@ -164,12 +164,28 @@ Requirements/limits:
   pysyndy change diverges the QEMU ABI, build pysyndy's own base instead.
 - The dynamic run needs a 512M `/dev/shm`; the orchestrator now starts workers with
   `--shm-size=1g`.
-- **The Morpheus tools (fid/ghidriff/bind_se) do NOT accept an ELF like `sample.axf`** —
-  their `find_vtor` reads the file's first word expecting a raw Cortex-M vector table and
-  aborts on the ELF magic (`0x464c457f`). They need a raw firmware `.bin` (e.g. betaflight)
-  or an explicit `firmware_vtor_table_addr`. So on `sample.axf` only `pysindy` (BN-based)
-  produces results; on a raw `.bin`, the Morpheus tools work but `pysindy` skips. Making the
-  Morpheus tools accept ELF input (VTOR override in `prepare_config`) is a possible follow-up.
+### E. Morpheus tools on ELF uploads — FIXED (ELF → raw flash image)
+Morpheus's tools (fid/ghidriff/bind_se/symbolic_regression) are a **headerless-firmware**
+toolchain: `find_vtor` reads the file's reset vector and Ghidra's `list_ghidra_functions`
+maps the file with the **BinaryLoader** at `-loader-baseAddr` (a raw blob) — both assume a
+raw Cortex-M `.bin`. An ELF upload (e.g. `sample.axf`) previously **crashed** them
+(`detect_vtor` saw the `\x7fELF` magic → `not in a Cortex-M RAM range`).
+
+Fix: `bind_helpers.prepare_config` now calls `bind_helpers.elf_to_firmware()` — for an ELF
+upload it writes the raw flash image (`<upload>.fw.bin`, each PT_LOAD placed by its LMA,
+windowed to the flash region so a RAM-LMA `.data` doesn't inflate it) and pins
+`firmware_vtor_table_addr` (lowest LMA) + `firmware_setup_end_addr` (the `main` symbol) so
+`detect_vtor`/boot-trace never run on a non-raw file. A raw `.bin` upload is used as-is.
+
+Result on `sample.axf`: no tool crashes; **ghidriff posts 4 identifications** and **pysindy
+4 equations**. `fid` runs but posts 0 (no FID-DB hits for this synthetic sample), and
+`symbolic_regression`/`bind_se` run but recover little — the raw blob has **no symbols**, so
+Morpheus's static FP-function detection is weaker than pysindy's, which reads the ELF directly
+(symbols + debug_info). This is architectural: **pysindy is the ELF-native recoverer; the
+Morpheus tools are strongest on raw `.bin` firmware** (e.g. betaflight, where fid/ghidriff/bind_se
+all work). Ghidra's BinaryLoader forbids feeding it the ELF directly, so raw conversion is the
+correct bridge; closing the SR/bind_se fidelity gap on ELFs would require ELF-native analysis
+in Morpheus (a larger upstream change).
 
 ---
 

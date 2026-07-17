@@ -74,6 +74,67 @@ def _write_overrides(base_toml, overrides):
     return path
 
 
+def elf_to_firmware(binary_path):
+    """If ``binary_path`` is an ELF, derive the raw Cortex-M flash image Morpheus
+    expects, plus its VTOR and setup_end. Returns ``(raw_bin_path, vtor, setup_end)``
+    or ``(None, None, None)`` when the input is not an ELF (already a raw ``.bin``)
+    or conversion fails.
+
+    fid/ghidriff/bind_se/symbolic_regression all load the firmware as a *raw* image
+    mapped at the VTOR (``list_binja_functions``/Ghidra/QEMU), and ``find_vtor`` reads
+    the file's reset vector -- both assume a raw ``.bin``. An ELF upload (e.g.
+    ``sample.axf``) breaks them (``detect_vtor`` sees the ``\\x7fELF`` magic). We
+    objcopy-equivalent the ELF to its raw flash image (placing each PT_LOAD by its
+    physical address, i.e. LMA), and read VTOR (= lowest LMA) and setup_end (= the
+    ``main`` symbol) straight from the ELF so ``detect_vtor``/boot-trace never run on
+    a non-raw input. pysyndy/pysindy still consume the ELF directly via xbin_api.
+    """
+    try:
+        with open(binary_path, "rb") as f:
+            if f.read(4) != b"\x7fELF":
+                return None, None, None
+    except OSError:
+        return None, None, None
+    try:
+        from elftools.elf.elffile import ELFFile
+
+        raw_path = os.path.abspath(binary_path) + ".fw.bin"
+        with open(binary_path, "rb") as f:
+            elf = ELFFile(f)
+            loads = [s for s in elf.iter_segments()
+                     if s["p_type"] == "PT_LOAD" and s["p_filesz"] > 0]
+            if not loads:
+                return None, None, None
+            base = min(s["p_paddr"] for s in loads)
+            # Keep only the flash region contiguous with the vector table; drop
+            # far segments (e.g. a RAM-LMA .data at 0x2000_0000) that would
+            # otherwise inflate the raw image to hundreds of MB.
+            _FLASH_SPAN = 16 * 1024 * 1024
+            loads = [s for s in loads if 0 <= s["p_paddr"] - base < _FLASH_SPAN]
+            end = max(s["p_paddr"] + s["p_filesz"] for s in loads)
+            if end - base > 128 * 1024 * 1024:  # sanity backstop
+                return None, None, None
+            img = bytearray(end - base)  # gaps zero-filled, like objcopy -O binary
+            for s in loads:
+                data = s.data()
+                off = s["p_paddr"] - base
+                img[off:off + len(data)] = data
+            setup_end = None
+            symtab = elf.get_section_by_name(".symtab")
+            if symtab is not None:
+                for sym in symtab.iter_symbols():
+                    if sym.name == "main":
+                        setup_end = int(sym["st_value"]) & ~1  # drop the Thumb bit
+                        break
+        with open(raw_path, "wb") as f:
+            f.write(img)
+        return raw_path, base, setup_end
+    except Exception as e:  # never let conversion break the run -- fall back to raw
+        print(f"[bind_helpers] ELF->raw firmware conversion failed for "
+              f"{binary_path}: {e!r}")
+        return None, None, None
+
+
 def prepare_config(binary_path, extra=None):
     """Build a per-run bind config for the uploaded binary.
 
@@ -84,6 +145,9 @@ def prepare_config(binary_path, extra=None):
     Optional sibling uploads override the baked reference set:
       ``<stem>.reference`` -> ``signature_match_binary`` (symbolized reference)
       ``<stem>.fidb``      -> ``fid_db_paths``           (prebuilt FID database)
+
+    ELF uploads are converted to the raw Cortex-M flash image Morpheus's tools
+    expect (see ``elf_to_firmware``); a raw ``.bin`` is used as-is.
     """
     from bind_jobs.util import load_bind_config, import_bind
 
@@ -97,6 +161,14 @@ def prepare_config(binary_path, extra=None):
         "qemu_path": _QEMU,
         "fastdyn_plugin_path": _FASTDYN,
     }
+    # An ELF upload (e.g. sample.axf) isn't a raw Cortex-M image: convert it and
+    # pin the VTOR/setup_end so detect_vtor / boot-trace don't run on a non-raw file.
+    raw_bin, vtor, setup_end = elf_to_firmware(binary_path)
+    if raw_bin:
+        overrides["firmware_bin_path"] = raw_bin
+        overrides["firmware_vtor_table_addr"] = f"0x{vtor:08x}"
+        if setup_end is not None:
+            overrides["firmware_setup_end_addr"] = f"0x{setup_end:08x}"
     ref = sibling(binary_path, ".reference")
     if ref:
         overrides["signature_match_binary"] = ref
