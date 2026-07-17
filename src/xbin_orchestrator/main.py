@@ -492,7 +492,10 @@ def bg_start_plugin(name: str, category: str):
         set_plugin_state(name, category, "STARTING")
         subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
         abs_uploads = os.path.abspath(UPLOAD_DIR)
-        run_cmd = ["docker", "run", "-d", "--name", container_name, "--network", "host", "-v", f"{abs_uploads}:/app/uploads", "-e", "XBIN_ORCHESTRATOR=localhost:50051", "-e", "REDIS_HOST=localhost", "-e", "PYTHONUNBUFFERED=1"]
+        # --shm-size: the pysindy/symbolic_regression dynamic runs boot Cortex-M
+        # firmware under QEMU system mode with a 512M /dev/shm memory-backend-file;
+        # the 64M container default is too small, so give every worker room.
+        run_cmd = ["docker", "run", "-d", "--name", container_name, "--network", "host", "--shm-size=1g", "-v", f"{abs_uploads}:/app/uploads", "-e", "XBIN_ORCHESTRATOR=localhost:50051", "-e", "REDIS_HOST=localhost", "-e", "PYTHONUNBUFFERED=1"]
         # Forward opt-in worker tunables (e.g. the bind_se fork-guard caps) when set.
         for _var in WORKER_ENV_PASSTHROUGH:
             _val = os.environ.get(_var)
