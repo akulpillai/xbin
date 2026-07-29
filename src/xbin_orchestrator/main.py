@@ -102,6 +102,15 @@ BACKEND_WEIGHTS = {
     "bind_se": 0.85,            # angr symbolic execution + ollama explanation
     "pysindy": 0.85,            # BIND binary->equation (Binja structure + numpy STLSQ sparse regression)
     "bind_arbiter": 1.0,        # ollama arbiter (ranker)
+    # fp_classification. Weights follow measured precision (docs/fp_detector_eval.md).
+    # Names are category-qualified on purpose: this map is keyed by backend name
+    # alone, so reusing a bare "binja"/"angr" would let a tool that is
+    # authoritative on one category outvote everyone on another.
+    "binja_fp": 0.95,           # BN hardware-VFP arithmetic detection (F1 1.000 on VFP arithmetic)
+    "angr_fp": 0.85,            # angr/capstone hardware-VFP detection (F1 0.894)
+    "softfp_callsite": 0.95,    # soft-float call sites (F1 0.978 on soft-float; blind to VFP)
+    "fp_validator": 0.90,       # vouches when two backends agree on the same verdict
+    "fp_ranker": 1.0,           # arithmetic/movement/soft arbiter (ranker)
 }
 MARGIN_THRESHOLD = 0.05
 
@@ -796,6 +805,7 @@ def dashboard():
                         <div style="display:grid; grid-template-columns: 1fr 1fr; gap:0.4rem;">
                             <label style="font-size:0.75rem; display:flex; align-items:center; gap:0.3rem;"><input type="checkbox" class="goal" value="signature_matching" checked> Signature Matching</label>
                             <label style="font-size:0.75rem; display:flex; align-items:center; gap:0.3rem;"><input type="checkbox" class="goal" value="equation_recovery" checked> Equation Recovery</label>
+                            <label style="font-size:0.75rem; display:flex; align-items:center; gap:0.3rem;"><input type="checkbox" class="goal" value="fp_classification" checked> Float Detection</label>
                         </div>
                     </div>
                     <button class="btn btn-primary" style="width:100%; margin-top:1rem; background:var(--success)" onclick="upload()">🚀 Start Analysis</button>
