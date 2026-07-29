@@ -148,12 +148,26 @@ class Worker:
             print(f"[ERROR] Rank update failed for {item_key}: {e}")
 
     def get_analysis(self, category: str, item_key: Optional[str] = None):
-        url = f"{self.rest_url}/api/v1/blackboard/{category}"
-        if item_key: url += f"/{item_key}"
+        """Read the blackboard.
+
+        Returns ``{item_key: {"status", "hypotheses": [...]}}`` for a category, or
+        that single state dict when ``item_key`` is given (None if absent).
+        ``hypotheses`` is score-descending, so index 0 is the current "truth".
+
+        Reads the ``/results`` route. The previous implementation requested
+        ``/api/v1/blackboard/{category}`` and ``/{category}/{item_key}``, neither
+        of which is a registered route -- both 404'd, so this returned a
+        ``{"detail": "Not Found"}`` body and no caller could consume consensus.
+        """
+        url = f"{self.rest_url}/api/v1/blackboard/{category}/results"
         try:
-            resp = requests.get(url, timeout=5)
-            return resp.json()
-        except: return None
+            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
+            results = (resp.json() or {}).get("results") or {}
+        except Exception as e:
+            print(f"[WARN] get_analysis({category}) failed: {e}")
+            return None
+        return results.get(item_key) if item_key is not None else results
 
     def run(self):
         print(f"[*] xbin Worker {self.name} starting event loop...")
