@@ -22,11 +22,21 @@ import tempfile
 # xbin blackboard categories for the BIND tools.
 CAT_SIGNATURE = "signature_matching"
 CAT_EQUATION = "equation_recovery"
+# "does this function do float math" -- previously a private step inside
+# symbolic_regression (its internal _filter_and_order), now its own category so
+# the hardware-VFP and soft-float detectors can compete and be ranked. They are
+# anti-correlated (Cohen kappa -0.10) and each caps at 0.600 recall alone, while
+# together they reach 1.000; see docs/fp_detector_eval.md.
+CAT_FP = "fp_classification"
 
 # In-image absolute paths (baked by submodules/Morpheus/docker/Dockerfile).
 MORPHEUS_ROOT = os.environ.get("MORPHEUS_ROOT", "/home/bind/Morpheus")
 _QEMU = os.path.join(MORPHEUS_ROOT, "qemu", "build", "qemu-system-arm")
 _FASTDYN = os.path.join(MORPHEUS_ROOT, "qemu", "build", "tests", "tcg", "plugins", "libvirtual.so")
+# libgcc soft-float reference baked into bind:latest; the default
+# ``softfp_match_binary`` for bind_se / sigmatch soft-FP matching.
+_SOFTFP_REF = os.path.join(MORPHEUS_ROOT, "signature_matching", "signatures",
+                           "arm-7e-m-libgcc", "output.elf")
 
 
 def sibling(binary_path, suffix):
@@ -72,6 +82,33 @@ def _write_overrides(base_toml, overrides):
     with os.fdopen(fd, "w") as f:
         f.writelines(out)
     return path
+
+
+def softfp_helper_names():
+    """Names Morpheus's soft-FP ABI table can resolve, as a set.
+
+    The ABI table is the single authority for "is this symbol a soft-float
+    helper": a helper whose ABI is unknown is dropped by the consumers anyway,
+    and the table deliberately excludes the ``__aeabi_`` routines that are not
+    float math (the unwinder, integer div/mod). Loaded by path because it is a
+    plain dict with no Binary Ninja dependency, so this works on a dev box too.
+    """
+    import importlib.util
+
+    path = os.path.join(MORPHEUS_ROOT, "binja_scripts", "softfp", "get_softfp_abi.py")
+    try:
+        spec = importlib.util.spec_from_file_location("_xbin_softfp_abi", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return set(mod.known_softfp_names())
+    except Exception as e:
+        # bind:latest bakes its own Morpheus copy, so a plugin container may see
+        # an older table without this accessor. Fall back to the name-family
+        # predicate rather than silently disabling soft-FP extraction, which
+        # would leave every soft-float argument typed as an int.
+        print(f"[bind_helpers] soft-FP ABI table unavailable ({e!r}); "
+              f"falling back to name-family matching")
+        return None  # sentinel: caller uses is_softfp_name()
 
 
 def elf_to_firmware(binary_path):
@@ -121,6 +158,13 @@ def elf_to_firmware(binary_path):
                 img[off:off + len(data)] = data
             setup_end = None
             func_addrs = set()
+            softfp = {}
+            known_softfp = softfp_helper_names()
+            if known_softfp is None:
+                from xbin.fp_common import is_softfp_name as _is_softfp
+            else:
+                def _is_softfp(n, _known=known_softfp):
+                    return n in _known
             symtab = elf.get_section_by_name(".symtab")
             if symtab is not None:
                 for sym in symtab.iter_symbols():
@@ -130,6 +174,8 @@ def elf_to_firmware(binary_path):
                         a = int(sym["st_value"]) & ~1
                         if base <= a < end:
                             func_addrs.add(a)
+                            if _is_softfp(sym.name):
+                                softfp[sym.name] = a
         with open(raw_path, "wb") as f:
             f.write(img)
         # Authoritative function list from the ELF's symbol table. The raw-blob
@@ -147,6 +193,18 @@ def elf_to_firmware(binary_path):
         if setup_end is not None:
             with open(raw_path + ".setup_end", "w") as f:
                 f.write(f"{setup_end:#x}\n")
+        # Soft-FP helper addresses, in the `<name>, <hex addr>` per-line format the
+        # pre_analysis scripts' soft_fp_addr_file parser expects. Morpheus's own
+        # acquisition path for this list is sigmatch's SE-signature match against a
+        # libgcc reference; on a non-stripped ELF the symbol table answers the same
+        # question exactly and for free, so we emit it here and let
+        # prepare_config() prefer it. Without this list
+        # gpr_input_is_float_analysis cannot see float values that reach a function
+        # through libgcc calls, and every soft-float argument is typed as an int.
+        if softfp:
+            with open(raw_path + ".softfp", "w") as f:
+                for name, a in sorted(softfp.items(), key=lambda kv: kv[1]):
+                    f.write(f"{name}, {a:08x}\n")
         return raw_path, base, setup_end
     except Exception as e:  # never let conversion break the run -- fall back to raw
         print(f"[bind_helpers] ELF->raw firmware conversion failed for "
@@ -194,6 +252,32 @@ def prepare_config(binary_path, extra=None):
     fidb = sibling(binary_path, ".fidb")
     if fidb:
         overrides["fid_db_paths"] = [fidb]
+
+    # --- soft-FP helper wiring -------------------------------------------- #
+    # Both of these are unset in the baked bind_config.toml, which silently
+    # disables every soft-FP code path: bind_se generates no soft-FP reference
+    # signatures, and pre_analysis gets an empty softfp_addrs_inout_dict, so a
+    # float argument arriving via libgcc calls is typed as an int.
+    #
+    # softfp_match_binary: the reference bind_se/sigmatch matches against. Prefer
+    # a `<stem>.softfp-reference` upload, else the libgcc reference baked into the
+    # image (it covered 42/42 of the helpers in the firmware we measured).
+    softfp_ref = sibling(binary_path, ".softfp-reference")
+    if not softfp_ref and os.path.exists(_SOFTFP_REF):
+        softfp_ref = _SOFTFP_REF
+    if softfp_ref:
+        overrides["softfp_match_binary"] = softfp_ref
+    # soft_fp_addr_file: an uploaded list wins; otherwise use the one derived from
+    # the ELF's symbol table by elf_to_firmware (exact and free). When the target
+    # is stripped neither exists, and sigmatch's SE-signature match against
+    # softfp_match_binary remains the acquisition path.
+    softfp_addrs = sibling(binary_path, ".softfp")
+    if not softfp_addrs and raw_bin:
+        cand = raw_bin + ".softfp"
+        if os.path.exists(cand):
+            softfp_addrs = cand
+    if softfp_addrs:
+        overrides["soft_fp_addr_file"] = softfp_addrs
     if extra:
         overrides.update(extra)
 
